@@ -1,7 +1,7 @@
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_unflatten, tree_map
-from typing import NamedTuple, List
+from typing import NamedTuple, List, Union, Literal
 from contextlib import contextmanager
 from .base_tensor import BaseTensor
 from socket import socket, AF_INET, SOCK_STREAM
@@ -23,12 +23,14 @@ class DTensorRef:
         self.id = _next_handle
 
 
-def dtensor_dispatch(func, args=(), kwargs=None, worker=None):
+def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
+    worker = sharding.mesh.workers[0] if sharding else None
     def unwrap_fake(t):
-        nonlocal worker
+        nonlocal worker, sharding
         if isinstance(t, DTensor):
             if worker is None:
                 worker = t._worker
+                sharding = t._sharding
             elif worker is not t._worker:
                 raise NotImplementedError("mixed workers")
             return t._fake
@@ -54,20 +56,20 @@ def dtensor_dispatch(func, args=(), kwargs=None, worker=None):
     flat_fake_tensors = [e for e in flat if isinstance(e, torch.Tensor)]
     flat_tensor_refs = [DTensorRef() for _ in flat_fake_tensors]
 
-    flat_results = iter(DTensor(fake, ref, worker) for fake, ref in zip(flat_fake_tensors, flat_tensor_refs))
+    flat_results = iter(DTensor(fake, ref, sharding) for fake, ref in zip(flat_fake_tensors, flat_tensor_refs))
     worker.send_command(func, ref_args, ref_kwargs, flat_tensor_refs)
     to_unflatten = [next(flat_results) if isinstance(e, torch.Tensor) else e for e in flat]
     results = tree_unflatten(to_unflatten, spec)
     return results
 
 class ActiveSharding(TorchDispatchMode):
-    def __init__(self, worker):
-        self.worker = worker
+    def __init__(self, sharding):
+        self.sharding = Sharding.lift(sharding)
     def __torch_dispatch__(self, func, types, args, kwargs):
         for x in tree_flatten((args, kwargs))[0]:
             if isinstance(x, torch.Tensor):
                 return func(*args, **kwargs)
-        return dtensor_dispatch(func, args, kwargs, worker=self.worker)
+        return dtensor_dispatch(func, args, kwargs, sharding=self.sharding)
 
 class PicklableFunc:
     def __init__(self, callable):
@@ -91,7 +93,7 @@ class DTensor(BaseTensor):
         cls,
         fake: torch.Tensor,
         ref: DTensorRef,
-        worker: 'Worker',
+        sharding: 'Sharding',
     ):
         r = torch.Tensor._make_wrapper_subclass(
             cls,
@@ -105,18 +107,21 @@ class DTensor(BaseTensor):
         )
         r._ref = ref
         r._fake = fake
-        r._worker = worker
+        assert isinstance(sharding, Sharding)
+        r._sharding = sharding
         return r
 
     def __init__(self, fake, ref, worker):
         pass
 
     @classmethod
-    def to_remote(cls, t: torch.Tensor, worker: 'Worker'):
+    def to_remote(cls, t: torch.Tensor, sharding: 'Sharding'):
+        sharding = Sharding.lift(sharding)
         f = fake_mode.from_tensor(t)
         r = DTensorRef()
-        worker.send_value(r, t)
-        return DTensor(f, r, worker)
+        result = DTensor(f, r, sharding)
+        result._worker.send_value(r, t)
+        return result
 
     def __repr__(self):
         if self.grad_fn:
@@ -126,6 +131,11 @@ class DTensor(BaseTensor):
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         return dtensor_dispatch(func, args, kwargs)
+
+    @property
+    def _worker(self):
+        # all the sharding is fake for now...
+        return self._sharding.mesh.workers[0]
 
     def to_local(self):
         return self._worker.request_value(self._ref)
@@ -138,7 +148,15 @@ class Manager:
         self.host = "127.0.0.1"
         self.port = 12345
         self.socket = socket(AF_INET, SOCK_STREAM)
-        self.socket.bind((self.host, self.port))
+        success = False
+        for i in range(10):
+            try:
+                self.socket.bind((self.host, self.port))
+                break
+            except OSError:
+                self.port += 1
+                print("Trying next port...")
+
         self.socket.listen(1)
 
     def create_worker(self):
@@ -208,3 +226,56 @@ class Worker:
 
     def get_debug(self):
         return False
+
+class WorkerMesh:
+    """
+    A multi-dimensional array of devices used to specify shardings.
+    Similar to the collective DTensor we have today
+    """
+    def __init__(self, workers: List[Worker], shape=None):
+        self.workers = workers
+        self.shape = torch.arange(len(self.workers)) if shape is None else shape
+
+    def reshape(self, dims: List[int]):
+        return WorkerMesh(self.workers, self.shape.reshape(dims))
+
+    def __getitem__(self, elem):
+        return WorkerMesh(self.workers, self.shape[elem])
+
+
+class Sharding(NamedTuple):
+    """
+    A description of how a single tensor is sharded across devices.
+    This is equivalent to our collective dtensor
+    """
+    mesh: WorkerMesh
+    # one entry per dimension of device mesh,
+    # which specifies how the tensor is represented
+    # in that dimension
+    sharding: List[Union[int, # shareded - e.g. the 0th dimension of
+                              #   of the tensor is split across this dimesion
+                              #   of the device mesh
+                 Literal["r", # replicated - a copy of the data is stored
+                              #   across this dimension of the device mesh
+                         "+"  # partial sum - the value of the tensor is
+                              #   the sum of the tensors stored along
+                              #   this dimension of the device mesh
+                         ]]]
+    # note: it is also equivlent to specify a sharding
+    # by saying if each dimension of the tensor is sharded and which
+    # device mesh dimension it correspond to, but it still
+    # requires saying whether the remaining device mesh dimensions are
+    # replicated or sharded.
+    @staticmethod
+    def lift(obj):
+        if isinstance(obj, Worker):
+            mesh = WorkerMesh([obj]).reshape(())
+            return Sharding(mesh=mesh, sharding = [])
+        elif isinstance(obj, Sharding):
+            return obj
+        else:
+            raise ValueError("expected Sharding")
+
+
+    def change(self, mesh=None, sharding=None):
+        return Sharding(mesh=mesh if mesh else self.mesh, sharding=sharding if sharding else self.sharding)

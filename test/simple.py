@@ -2,12 +2,12 @@ from single_controller import DTensor, ActiveSharding, Manager
 import torch
 m = Manager()
 w = m.create_worker()
-x = DTensor.to_remote(torch.ones(2, 2), worker=w)
+x = DTensor.to_remote(torch.ones(2, 2), sharding=w)
 xx = x.add(x).add(x).max(dim=0)
 f = xx[0].to_local()
 print(f.wait())
 
-with ActiveSharding(worker=w):
+with ActiveSharding(sharding=w):
     o = torch.ones(2) + x
 
 
