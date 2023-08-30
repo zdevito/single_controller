@@ -23,38 +23,6 @@ class DTensorRef:
         self.id = _next_handle
 
 
-# pretend to be a remote worker but just compute in this process
-class FakeRemote:
-    def __init__(self):
-        self.ref_to_tensor = {}
-    def send_command(self, func, args, kwargs, results):
-        def get_tensor(t):
-            if isinstance(t, DTensorRef):
-                return self.ref_to_tensor[t.id]
-            else:
-                return t
-        args = tree_map(get_tensor, args)
-        kwargs = tree_map(get_tensor, kwargs)
-        result = func(*args, **kwargs)
-        flat_results, _ = tree_flatten(result)
-        real_results = [e for e in flat_results if isinstance(e, torch.Tensor)]
-        for real, ref in zip(real_results, results):
-
-            self.ref_to_tensor[ref.id] = real
-
-    def request_value(self, ref: DTensorRef):
-        f = Future()
-        f.set_result(self.ref_to_tensor[ref.id])
-        return f
-
-    def send_value(self, ref: DTensorRef, value: torch.Tensor):
-        self.ref_to_tensor[ref.id] = value
-
-    def del_value(self, ref: DTensorRef):
-        del self.ref_to_tensor[ref.id]
-
-# remote = FakeRemote()
-
 def dtensor_dispatch(func, args=(), kwargs=None, worker=None):
     def unwrap_fake(t):
         nonlocal worker
@@ -179,7 +147,6 @@ class Manager:
         # create pipes, but this uses sockets so that we can add remote processes without changing the
         # setup.
         proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret])
-        print("ACCEPT BEGIN")
         client_socket, client_address = self.socket.accept()
         return Worker(proc, client_socket, secret)
 
