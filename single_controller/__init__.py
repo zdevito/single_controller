@@ -2,7 +2,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_unflatten, tree_map
 from typing import NamedTuple, List, Union, Literal
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from .base_tensor import BaseTensor
 from socket import socket, AF_INET, SOCK_STREAM
 from uuid import uuid4
@@ -10,10 +10,10 @@ from subprocess import Popen
 import sys
 from pickle import Unpickler, Pickler
 import asyncio
+import threading
 
 from torch._subclasses.fake_tensor import FakeTensorMode
 fake_mode = FakeTensorMode()
-
 
 _next_handle = 0
 class DTensorRef:
@@ -70,17 +70,33 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     results = tree_unflatten(to_unflatten, spec)
     return results
 
-class ActiveSharding(TorchDispatchMode):
+
+
+tls = threading.local()
+
+@contextmanager
+def active_sharding(sharding):
+    if not hasattr(tls, 'sharding'):
+        tls.sharding = 'inactive'
+    sharding = None if sharding is None else Sharding.lift(sharding)
+    old_sharding = tls.sharding
+    ctx = _ActiveSharding() if old_sharding == 'inactive' else nullcontext()
+    with ctx:
+        tls.sharding = sharding
+        try:
+            yield
+        finally:
+            tls.sharding = old_sharding
+
+class _ActiveSharding(TorchDispatchMode):
     ignore = ['profiler._record_function_exit._RecordFunction']
-    def __init__(self, sharding):
-        self.sharding = Sharding.lift(sharding)
     def __torch_dispatch__(self, func, types, args, kwargs):
-        if str(func) in self.ignore:
+        if getattr(tls, 'sharding', None) is None or str(func) in self.ignore:
             return func(*args, **kwargs)
         for x in tree_flatten((args, kwargs))[0]:
             if isinstance(x, torch.Tensor):
                 return func(*args, **kwargs)
-        return dtensor_dispatch(func, args, kwargs, sharding=self.sharding)
+        return dtensor_dispatch(func, args, kwargs, sharding=tls.sharding)
 
 class PicklableFunc:
     def __init__(self, callable):
@@ -185,6 +201,30 @@ class Future(asyncio.Future):
         while not self.done():
             worker.wait_one()
         return self.result()
+    def then(self, cb):
+        self.add_done_callback(lambda x: cb(x.result()))
+
+def to_local(obj):
+    def gen():
+        flat, spec = tree_flatten(obj)
+        flat = [f.to_local() if isinstance(f, DTensor) else f for f in flat]
+        concrete = []
+        for x in flat:
+            if isinstance(x, Future):
+                x = yield x
+            concrete.append(x)
+        result.set_result(tree_unflatten(concrete, spec))
+    g = gen()
+    f = next(g)
+    result = Future(loop=f.get_loop())
+    def process(f):
+        try:
+            f = g.send(f.result())
+            f.add_done_callback(process)
+        except StopIteration:
+            pass
+    f.add_done_callback(process)
+    return result
 
 class Worker:
     def __init__(self, proc, sock, secret):
