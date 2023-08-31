@@ -1,7 +1,12 @@
-from single_controller import DTensor, ActiveSharding, Manager
+from single_controller import DTensor, ActiveSharding, Manager, LocalWorker
 import torch
-m = Manager()
-w = m.create_worker()
+real = False
+if real:
+    m = Manager()
+    w = m.create_worker()
+else:
+    w = LocalWorker()
+
 x = DTensor.to_remote(torch.ones(2, 2), sharding=w)
 xx = x.add(x).add(x).max(dim=0)
 f = xx[0].to_local()

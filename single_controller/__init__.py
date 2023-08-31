@@ -227,6 +227,50 @@ class Worker:
     def get_debug(self):
         return False
 
+class LocalWorker:
+    """
+    Run in the local process rather than remotely
+    """
+    def __init__(self):
+        self.ref_to_tensor = {}
+    def send_command(self, func, args, kwargs, results):
+        def get_tensor(t):
+            if isinstance(t, DTensorRef):
+                return self.ref_to_tensor[t.id]
+            else:
+                return t
+        args = tree_map(get_tensor, args)
+        kwargs = tree_map(get_tensor, kwargs)
+        result = func(*args, **kwargs)
+        flat_results, _ = tree_flatten(result)
+        real_results = [e for e in flat_results if isinstance(e, torch.Tensor)]
+        for real, ref in zip(real_results, results):
+            self.ref_to_tensor[ref.id] = real
+
+    def request_value(self, ref: DTensorRef):
+        f = Future(loop=self)
+        f.set_result(self.ref_to_tensor[ref.id])
+        return f
+
+    def wait_one(self):
+        pass
+
+    def wait_all(self):
+        pass
+
+    def send_value(self, ref: DTensorRef, value: torch.Tensor):
+        self.ref_to_tensor[ref.id] = value
+
+    def del_value(self, ref: DTensorRef):
+        del self.ref_to_tensor[ref.id]
+
+    # HACKS: event loop functions to make Future object happy
+    def call_soon(self, callback, *args, context):
+        context.run(callback, *args)
+
+    def get_debug(self):
+        return False
+
 class WorkerMesh:
     """
     A multi-dimensional array of devices used to specify shardings.
@@ -268,7 +312,7 @@ class Sharding(NamedTuple):
     # replicated or sharded.
     @staticmethod
     def lift(obj):
-        if isinstance(obj, Worker):
+        if isinstance(obj, (LocalWorker,Worker)):
             mesh = WorkerMesh([obj]).reshape(())
             return Sharding(mesh=mesh, sharding = [])
         elif isinstance(obj, Sharding):
