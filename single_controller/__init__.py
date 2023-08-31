@@ -25,6 +25,14 @@ class DTensorRef:
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     worker = sharding.mesh.workers[0] if sharding else None
+    def stringify(t):
+        if isinstance(t, DTensor):
+            return 'DTensor'
+        elif isinstance(t, torch.Tensor):
+            return 'Tensor'
+        else:
+            return t
+
     def unwrap_fake(t):
         nonlocal worker, sharding
         if isinstance(t, DTensor):
@@ -35,7 +43,7 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
                 raise NotImplementedError("mixed workers")
             return t._fake
         elif isinstance(t, torch.Tensor):
-            raise NotImplementedError("mixed DTensor/local tensor")
+            raise NotImplementedError(f"mixed DTensor/local tensor {func}(args={tree_map(stringify, args)} kwargs={tree_map(stringify, kwargs)})")
         else:
             return t
     def unwrap_ref(t):
@@ -63,9 +71,12 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     return results
 
 class ActiveSharding(TorchDispatchMode):
+    ignore = ['profiler._record_function_exit._RecordFunction']
     def __init__(self, sharding):
         self.sharding = Sharding.lift(sharding)
     def __torch_dispatch__(self, func, types, args, kwargs):
+        if str(func) in self.ignore:
+            return func(*args, **kwargs)
         for x in tree_flatten((args, kwargs))[0]:
             if isinstance(x, torch.Tensor):
                 return func(*args, **kwargs)
