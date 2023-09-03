@@ -241,24 +241,25 @@ class Worker:
 
     def request_value(self, ref: DTensorRef):
         self.output.dump(('request_value', ref))
-        self.pending_futures
         f = Future(loop=self)
+        if len(self.pending_futures) == 8:
+            self.wait(n=4)
         self.pending_futures.append(f)
         return f
 
-    def wait_one(self):
-        assert self.pending_futures
-        self.ofile.flush()
-        # TODO error pathways are not implemented
-        # here or on worker if something goes wrong with a command
-        self.pending_futures.pop().set_result(self.input.load())
-
-    def wait_all(self):
+    def wait(self, n=None):
+        if n is None:
+            n = len(self.pending_futures)
         if self.pending_futures:
             self.ofile.flush()
-            for f in self.pending_futures:
-                f.set_result(self.input.load())
-            self.pending_futures.clear()
+            for i in range(n):
+                self.pending_futures.pop().set_result(self.input.load())
+
+    def wait_one(self):
+        return self.wait(n=1)
+
+    def wait_all(self):
+        return self.wait()
 
     def send_value(self, ref: DTensorRef, value: torch.Tensor):
         self.output.dump(('send_value', ref, value))
