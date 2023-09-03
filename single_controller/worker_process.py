@@ -1,6 +1,6 @@
 from socket import AF_INET, SOCK_STREAM, socket
 from . import DTensorRef
-from pickle import Pickler, Unpickler
+import pickle
 import sys
 import torch
 from time import sleep
@@ -15,21 +15,19 @@ class LocalWorker:
         self.socket.connect((host, int(port)))
         self.ofile = self.socket.makefile("wb")
         self.ifile = self.socket.makefile("rb")
-        self.output = Pickler(self.ofile)
-        self.input = Unpickler(self.ifile)
-        self.output.dump(secret)
+        self._write_pickle(secret)
         self.ofile.flush()
         self.ref_to_tensor = {}
 
     def run(self):
         while True:
-            method, *args = self.input.load()
+            method, *args = self._read_pickle()
             # print("method:", method, args)
             if method == 'exit':
                 return
             result = getattr(self, method)(*args)
             if result is not no_response:
-                self.output.dump(result)
+                self._write_pickle(result)
                 self.ofile.flush()
 
     def send_command(self, func, args, kwargs, results):
@@ -57,6 +55,16 @@ class LocalWorker:
     def del_value(self, ref: DTensorRef):
         del self.ref_to_tensor[ref.id]
         return no_response
+
+    def _write_pickle(self, obj):
+        b = pickle.dumps(obj)
+        sz = len(b).to_bytes(8, 'little')
+        self.ofile.write(sz)
+        self.ofile.write(b)
+
+    def _read_pickle(self):
+        sz = int.from_bytes(self.ifile.read(8), 'little')
+        return pickle.loads(self.ifile.read(sz))
 
 if __name__ == "__main__":
     _, host, port, secret = sys.argv

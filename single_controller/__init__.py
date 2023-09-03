@@ -8,7 +8,7 @@ from socket import socket, AF_INET, SOCK_STREAM
 from uuid import uuid4
 from subprocess import Popen
 import sys
-from pickle import Unpickler, Pickler
+import pickle
 import asyncio
 import threading
 
@@ -168,6 +168,8 @@ class DTensor(BaseTensor):
         return self._worker.request_value(self._ref)
 
     def __del__(self):
+        if sys is None:
+            return # pytho shutdown
         self._worker.del_value(self._ref)
 
 class Manager:
@@ -231,16 +233,15 @@ class Worker:
         self.proc = proc
         self.ofile = sock.makefile("wb")
         self.ifile = sock.makefile("rb")
-        self.output = Pickler(self.ofile)
-        self.input = Unpickler(self.ifile)
-        assert secret == self.input.load()
+        self._dumps, self._loads = pickle.dumps, pickle.loads
+        assert secret == self._read_pickle()
         self.pending_futures = []
 
     def send_command(self, func, args, kwargs, results):
-        self.output.dump(('send_command', PicklableFunc(func), args, kwargs, results))
+        self._write_pickle(('send_command', PicklableFunc(func), args, kwargs, results))
 
     def request_value(self, ref: DTensorRef):
-        self.output.dump(('request_value', ref))
+        self._write_pickle(('request_value', ref))
         f = Future(loop=self)
         if len(self.pending_futures) == 8:
             self.wait(n=4)
@@ -253,7 +254,7 @@ class Worker:
         if self.pending_futures:
             self.ofile.flush()
             for i in range(n):
-                self.pending_futures.pop().set_result(self.input.load())
+                self.pending_futures.pop().set_result(self._read_pickle())
 
     def wait_one(self):
         return self.wait(n=1)
@@ -262,13 +263,13 @@ class Worker:
         return self.wait()
 
     def send_value(self, ref: DTensorRef, value: torch.Tensor):
-        self.output.dump(('send_value', ref, value))
+        self._write_pickle(('send_value', ref, value))
 
     def del_value(self, ref: DTensorRef):
-        self.output.dump(('del_value', ref))
+        self._write_pickle(('del_value', ref))
 
     def __del__(self):
-        self.output.dump(('exit',))
+        self._write_pickle(('exit',))
         self.ofile.flush()
         self.proc.wait()
 
@@ -278,6 +279,16 @@ class Worker:
 
     def get_debug(self):
         return False
+
+    def _write_pickle(self, obj):
+        b = self._dumps(obj)
+        sz = len(b).to_bytes(8, 'little')
+        self.ofile.write(sz)
+        self.ofile.write(b)
+
+    def _read_pickle(self):
+        sz = int.from_bytes(self.ifile.read(8), 'little')
+        return self._loads(self.ifile.read(sz))
 
 class LocalWorker:
     """
