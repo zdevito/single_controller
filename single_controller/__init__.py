@@ -194,7 +194,8 @@ class Manager:
         self.host = "127.0.0.1"
         self.port = 12345
         self.loop = asyncio.get_event_loop()
-        self.thread = threading.Thread(target=self.loop.run_forever)
+        self.shutdown_event = asyncio.Event()
+        self.thread = threading.Thread(target=lambda: self.loop.run_until_complete(self.shutdown_event.wait()))
         self.thread.start()
         _run_void(self.accept_new_connections())
         self.workers = {} # uuid -> Worker
@@ -227,8 +228,29 @@ class Manager:
         result.proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret])
         return result
 
+    def complete(self):
+        _last_event.wait()
+        async def shutdown():
+            for worker in self.workers.values():
+                b = pickle.dumps(('exit',))
+                await worker._send_bytes(b)
+            self.shutdown_event.set()
+        _run_void(shutdown())
+        for worker in self.workers.values():
+            worker.proc.wait()
+
 # monkey patch...
-Future.then = lambda self, cb:  self.add_done_callback(lambda x: cb(x.result()))
+_last_event = None
+def _then(self, cb):
+    global _last_event
+    # track when the last callback that was registered ran
+    _last_event = this_event = threading.Event()
+    def run(x):
+        cb(x.result())
+        this_event.set()
+    self.add_done_callback(run)
+
+Future.then = _then
 Future.wait = Future.result
 
 def to_local(obj):
