@@ -19,5 +19,4 @@ with active_sharding(sharding=w):
 x.to_local()
 o.to_local().then(lambda f: print("CB", f))
 to_local({'x': x, 'o': o, 'y': x + x + x}).then(print)
-print("BEFORE WAIT")
-w.wait_all()
+

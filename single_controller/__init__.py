@@ -11,6 +11,8 @@ import sys
 import pickle
 import asyncio
 import threading
+from concurrent.futures import Future
+import traceback
 
 from torch._subclasses.fake_tensor import FakeTensorMode
 fake_mode = FakeTensorMode()
@@ -113,6 +115,10 @@ class PicklableFunc:
             return PicklableFunc, ("torch.ops." + str(self.callable),)
         else:
             return PicklableFunc, (self.callable,)
+    def __repr__(self):
+        return repr(self.callable)
+    def __str__(self):
+        return str(self.callable)
 
 class DTensor(BaseTensor):
     @staticmethod
@@ -165,102 +171,91 @@ class DTensor(BaseTensor):
         return self._sharding.mesh.workers[0]
 
     def to_local(self):
-        return self._worker.request_value(self._ref)
+        worker = self._worker
+        loop = asyncio.get_event_loop()
+        return asyncio.run_coroutine_threadsafe(worker.request_value(self._ref), loop)
 
     def __del__(self):
         if sys is None:
             return # pytho shutdown
         self._worker.del_value(self._ref)
 
+
+def _run_void(co):
+    async def wrap():
+        try:
+            await co
+        except:
+            traceback.print_exc()
+    asyncio.run_coroutine_threadsafe(wrap(), asyncio.get_event_loop())
+
 class Manager:
     def __init__(self):
         self.host = "127.0.0.1"
         self.port = 12345
-        self.socket = socket(AF_INET, SOCK_STREAM)
-        success = False
-        for i in range(10):
-            try:
-                self.socket.bind((self.host, self.port))
-                break
-            except OSError:
-                self.port += 1
-                print("Trying next port...")
+        self.loop = asyncio.get_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever)
+        self.thread.start()
+        _run_void(self.accept_new_connections())
+        self.workers = {} # uuid -> Worker
+        self.server_started = asyncio.Event()
 
-        self.socket.listen(1)
+    async def accept_new_connections(self):
+        # TODO: goto next port?
+        server = await asyncio.start_server(self.new_connection, self.host, self.port)
+        async with server:
+            self.server_started.set()
+            await server.serve_forever()
+
+    async def new_connection(self, reader, writer):
+        sz = int.from_bytes(await reader.read(8), 'little')
+        secret = pickle.loads(await reader.read(sz))
+        worker = self.workers[secret]
+        await worker.connect(reader, writer)
 
     def create_worker(self):
+        # we need to wait for the server to start serving
+        # otherwise the new process will not be able to connect
+        f = asyncio.run_coroutine_threadsafe(self.server_started.wait(), self.loop)
+        f.result()
+
         secret = str(uuid4())
         # if we were only ever going to use local processes then it would easier to just directly
         # create pipes, but this uses sockets so that we can add remote processes without changing the
         # setup.
-        proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret])
-        client_socket, client_address = self.socket.accept()
-        return Worker(proc, client_socket, secret)
+        self.workers[secret] = result = Worker()
+        result.proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret])
+        return result
 
-class Future(asyncio.Future):
-    def wait(self):
-        worker = self.get_loop() # actually our worker
-        while not self.done():
-            worker.wait_one()
-        return self.result()
-    def then(self, cb):
-        self.add_done_callback(lambda x: cb(x.result()))
+# monkey patch...
+Future.then = lambda self, cb:  self.add_done_callback(lambda x: cb(x.result()))
+Future.wait = Future.result
 
 def to_local(obj):
-    def gen():
-        flat, spec = tree_flatten(obj)
-        flat = [f.to_local() if isinstance(f, DTensor) else f for f in flat]
-        concrete = []
-        for x in flat:
-            if isinstance(x, Future):
-                x = yield x
-            concrete.append(x)
-        result.set_result(tree_unflatten(concrete, spec))
-    g = gen()
-    f = next(g)
-    result = Future(loop=f.get_loop())
-    def process(f):
-        try:
-            f = g.send(f.result())
-            f.add_done_callback(process)
-        except StopIteration:
-            pass
-    f.add_done_callback(process)
-    return result
+    flat, spec = tree_flatten(obj)
+    dtensors = [f for f in flat if isinstance(f, DTensor)]
+    if not dtensors:
+        return obj
+    async def work():
+        gathered = await asyncio.gather(*(d._worker.request_value(d._ref) for d in dtensors))
+        git = iter(gathered)
+        new_flat = [next(git) if isinstance(f, DTensor) else f for f in flat]
+        return tree_unflatten(new_flat, spec)
+    return asyncio.run_coroutine_threadsafe(work(), asyncio.get_event_loop())
 
 class Worker:
-    def __init__(self, proc, sock, secret):
-        self.proc = proc
-        self.ofile = sock.makefile("wb")
-        self.ifile = sock.makefile("rb")
-        self._dumps, self._loads = pickle.dumps, pickle.loads
-        assert secret == self._read_pickle()
-        self.pending_futures = []
+    def __init__(self):
+        self.ready = asyncio.Event()
+        self.last_request = self.ready
+        self._dumps = pickle.dumps
+        self._loads = pickle.loads
+
+    async def connect(self, reader, writer):
+        self.reader, self.writer = reader, writer
+        self.ready.set()
 
     def send_command(self, func, args, kwargs, results):
         self._write_pickle(('send_command', PicklableFunc(func), args, kwargs, results))
-
-    def request_value(self, ref: DTensorRef):
-        self._write_pickle(('request_value', ref))
-        f = Future(loop=self)
-        if len(self.pending_futures) == 8:
-            self.wait(n=4)
-        self.pending_futures.append(f)
-        return f
-
-    def wait(self, n=None):
-        if n is None:
-            n = len(self.pending_futures)
-        if self.pending_futures:
-            self.ofile.flush()
-            for i in range(n):
-                self.pending_futures.pop().set_result(self._read_pickle())
-
-    def wait_one(self):
-        return self.wait(n=1)
-
-    def wait_all(self):
-        return self.wait()
 
     def send_value(self, ref: DTensorRef, value: torch.Tensor):
         self._write_pickle(('send_value', ref, value))
@@ -268,27 +263,32 @@ class Worker:
     def del_value(self, ref: DTensorRef):
         self._write_pickle(('del_value', ref))
 
-    def __del__(self):
-        self._write_pickle(('exit',))
-        self.ofile.flush()
-        self.proc.wait()
-
-    # HACKS: event loop functions to make Future object happy
-    def call_soon(self, callback, *args, context):
-        context.run(callback, *args)
-
-    def get_debug(self):
-        return False
-
     def _write_pickle(self, obj):
         b = self._dumps(obj)
-        sz = len(b).to_bytes(8, 'little')
-        self.ofile.write(sz)
-        self.ofile.write(b)
+        _run_void(self._send_bytes(b))
 
-    def _read_pickle(self):
-        sz = int.from_bytes(self.ifile.read(8), 'little')
-        return self._loads(self.ifile.read(sz))
+    async def _send_bytes(self, b):
+        await self.ready.wait()
+        sz = len(b).to_bytes(8, 'little')
+        self.writer.write(sz)
+        self.writer.write(b)
+        await self.writer.drain()
+
+    async def request_value(self, ref: DTensorRef):
+        await self.ready.wait()
+        last_request = self.last_request
+        this_request = self.last_request = asyncio.Event()
+        b = self._dumps(('request_value', ref))
+        sz = len(b).to_bytes(8, 'little')
+        self.writer.write(sz)
+        self.writer.write(b)
+        await self.writer.drain()
+        await last_request.wait()
+        b = await self.reader.read(8)
+        sz = int.from_bytes(b, 'little')
+        obj = self._loads(await self.reader.read(sz))
+        this_request.set()
+        return obj
 
 class LocalWorker:
     """
