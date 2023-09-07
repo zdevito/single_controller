@@ -13,6 +13,7 @@ import asyncio
 import threading
 from concurrent.futures import Future
 import traceback
+import atexit
 
 from torch._subclasses.fake_tensor import FakeTensorMode
 fake_mode = FakeTensorMode()
@@ -195,8 +196,9 @@ class Manager:
         self.port = 12345
         self.loop = asyncio.get_event_loop()
         self.shutdown_event = asyncio.Event()
-        self.thread = threading.Thread(target=lambda: self.loop.run_until_complete(self.shutdown_event.wait()))
+        self.thread = threading.Thread(target=lambda: self.loop.run_until_complete(self.shutdown_event.wait()), daemon=True)
         self.thread.start()
+        atexit.register(self.complete)
         _run_void(self.accept_new_connections())
         self.workers = {} # uuid -> Worker
         self.server_started = asyncio.Event()
