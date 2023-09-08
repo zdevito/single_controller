@@ -24,6 +24,8 @@ class DTensorRef:
         global _next_handle
         _next_handle += 1
         self.id = _next_handle
+    def __repr__(self):
+        return f"DTensorRef({self.id})"
 
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
@@ -173,8 +175,7 @@ class DTensor(BaseTensor):
 
     def to_local(self):
         worker = self._worker
-        loop = asyncio.get_event_loop()
-        return asyncio.run_coroutine_threadsafe(worker.request_value(self._ref), loop)
+        return worker.request_values([self._ref], lambda x: x[0])
 
     def __del__(self):
         if sys is None:
@@ -182,13 +183,22 @@ class DTensor(BaseTensor):
         self._worker.del_value(self._ref)
 
 
-def _run_void(co):
+def _run_void(co, loop):
     async def wrap():
         try:
             await co
         except:
             traceback.print_exc()
-    asyncio.run_coroutine_threadsafe(wrap(), asyncio.get_event_loop())
+    asyncio.run_coroutine_threadsafe(wrap(), loop)
+
+
+# tree_flatten but also take a condition about which non-tree values we care about
+def flatten(tree, cond):
+    r, spec = tree_flatten(tree)
+    def unflatten(n):
+        n_it = iter(n)
+        return tree_unflatten([next(n_it) if cond(e) else e for e in r], spec)
+    return [e for e in r if cond(e)], unflatten
 
 class Manager:
     def __init__(self):
@@ -199,7 +209,7 @@ class Manager:
         self.thread = threading.Thread(target=lambda: self.loop.run_until_complete(self.shutdown_event.wait()), daemon=True)
         self.thread.start()
         atexit.register(self.complete)
-        _run_void(self.accept_new_connections())
+        _run_void(self.accept_new_connections(), self.loop)
         self.workers = {} # uuid -> Worker
         self.server_started = asyncio.Event()
 
@@ -226,18 +236,20 @@ class Manager:
         # if we were only ever going to use local processes then it would easier to just directly
         # create pipes, but this uses sockets so that we can add remote processes without changing the
         # setup.
-        self.workers[secret] = result = Worker()
+        self.workers[secret] = result = Worker(self.loop)
         result.proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret])
         return result
 
     def complete(self):
-        _last_event.wait()
+        if _last_event is not None:
+            _last_event.wait()
         async def shutdown():
             for worker in self.workers.values():
                 b = pickle.dumps(('exit',))
-                await worker._send_bytes(b)
+                worker.commands_to_send.append(b)
+                await worker._notify_new_commands()
             self.shutdown_event.set()
-        _run_void(shutdown())
+        _run_void(shutdown(), self.loop)
         for worker in self.workers.values():
             worker.proc.wait()
 
@@ -256,27 +268,40 @@ Future.then = _then
 Future.wait = Future.result
 
 def to_local(obj):
-    flat, spec = tree_flatten(obj)
-    dtensors = [f for f in flat if isinstance(f, DTensor)]
-    if not dtensors:
-        return obj
-    async def work():
-        gathered = await asyncio.gather(*(d._worker.request_value(d._ref) for d in dtensors))
-        git = iter(gathered)
-        new_flat = [next(git) if isinstance(f, DTensor) else f for f in flat]
-        return tree_unflatten(new_flat, spec)
-    return asyncio.run_coroutine_threadsafe(work(), asyncio.get_event_loop())
+    flat, unflatten = flatten(obj, lambda x: isinstance(x, DTensor))
+    w = flat[0]._worker
+    return w.request_values([f._ref for f in flat], unflatten)
 
 class Worker:
-    def __init__(self):
-        self.ready = asyncio.Event()
-        self.last_request = self.ready
+    def __init__(self, loop):
+        self.loop = loop
         self._dumps = pickle.dumps
         self._loads = pickle.loads
+        self.new_commands = asyncio.Condition()
+        self.commands_to_send = []
+        self.pending_futures = []
 
-    async def connect(self, reader, writer):
-        self.reader, self.writer = reader, writer
-        self.ready.set()
+    async def connect(self, r, w):
+        await asyncio.gather(self.reader(r), self.writer(w))
+
+    async def reader(self, r):
+        while True:
+            b = await r.read(8)
+            sz = int.from_bytes(b, 'little')
+            obj = self._loads(await r.read(sz))
+            f = self.pending_futures.pop(0)
+            f.set_result(obj)
+
+    async def writer(self, w):
+        while True:
+            try:
+                b = self.commands_to_send.pop(0)
+                w.write(len(b).to_bytes(8, 'little'))
+                w.write(b)
+            except IndexError:
+                await w.drain()
+                async with self.new_commands:
+                    await self.new_commands.wait()
 
     def send_command(self, func, args, kwargs, results):
         self._write_pickle(('send_command', PicklableFunc(func), args, kwargs, results))
@@ -287,32 +312,23 @@ class Worker:
     def del_value(self, ref: DTensorRef):
         self._write_pickle(('del_value', ref))
 
-    def _write_pickle(self, obj):
+    def _write_pickle(self, obj, future=None):
         b = self._dumps(obj)
-        _run_void(self._send_bytes(b))
+        self.commands_to_send.append(b)
+        _run_void(self._notify_new_commands(), self.loop)
 
-    async def _send_bytes(self, b):
-        await self.ready.wait()
-        sz = len(b).to_bytes(8, 'little')
-        self.writer.write(sz)
-        self.writer.write(b)
-        await self.writer.drain()
+    async def _notify_new_commands(self):
+        async with self.new_commands:
+            self.new_commands.notify()
 
-    async def request_value(self, ref: DTensorRef):
-        await self.ready.wait()
-        last_request = self.last_request
-        this_request = self.last_request = asyncio.Event()
-        b = self._dumps(('request_value', ref))
-        sz = len(b).to_bytes(8, 'little')
-        self.writer.write(sz)
-        self.writer.write(b)
-        await self.writer.drain()
-        await last_request.wait()
-        b = await self.reader.read(8)
-        sz = int.from_bytes(b, 'little')
-        obj = self._loads(await self.reader.read(sz))
-        this_request.set()
-        return obj
+    def request_values(self, requests: List[DTensorRef], postprocess):
+        futures = [self.loop.create_future() for _ in requests]
+        self.pending_futures.extend(futures)
+        self.commands_to_send.extend([self._dumps(('request_value', r)) for r in requests])
+        async def run():
+            await self._notify_new_commands()
+            return postprocess(await asyncio.gather(*futures))
+        return asyncio.run_coroutine_threadsafe(run(), self.loop)
 
 class LocalWorker:
     """
@@ -334,9 +350,9 @@ class LocalWorker:
         for real, ref in zip(real_results, results):
             self.ref_to_tensor[ref.id] = real
 
-    def request_value(self, ref: DTensorRef):
-        f = Future(loop=self)
-        f.set_result(self.ref_to_tensor[ref.id])
+    def request_values(self, refs: List[DTensorRef], postprocess):
+        f = Future()
+        f.set_result(postprocess([self.ref_to_tensor[ref.id] for ref in refs]))
         return f
 
     def wait_one(self):

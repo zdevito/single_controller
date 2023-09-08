@@ -10,14 +10,17 @@ else:
 x = DTensor.to_remote(torch.ones(2, 2), sharding=w)
 xx = x.add(x).add(x).max(dim=0)
 f = xx[0].to_local()
-print(f.wait())
+
+assert (torch.allclose(torch.ones(2)*3, f.wait()))
 
 with active_sharding(sharding=w):
     o = torch.ones(2) + x
 
 
-x.to_local()
-o.to_local().then(lambda f: print("CB", f))
+lo = o.to_local()
+
+lo.then(lambda f: print("CB", f))
+assert torch.allclose(lo.wait(), torch.ones(2, 2) * 2)
+
 to_local({'x': x, 'o': o, 'y': x + x + x}).then(print)
 
-# m.complete()
