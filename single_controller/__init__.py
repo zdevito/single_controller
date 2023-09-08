@@ -202,6 +202,11 @@ def flatten(tree, cond):
 
 class Manager:
     def __init__(self):
+        self.workers = {} # uuid -> Worker
+
+    def _start_loop(self):
+        if hasattr(self, 'loop'):
+            return
         self.host = "127.0.0.1"
         self.port = 12345
         self.loop = asyncio.get_event_loop()
@@ -210,7 +215,6 @@ class Manager:
         self.thread.start()
         atexit.register(self.complete)
         _run_void(self.accept_new_connections(), self.loop)
-        self.workers = {} # uuid -> Worker
         self.server_started = asyncio.Event()
 
     async def accept_new_connections(self):
@@ -226,13 +230,18 @@ class Manager:
         worker = self.workers[secret]
         await worker.connect(reader, writer)
 
-    def create_worker(self):
+    def create_worker(self, local=False):
+        secret = str(uuid4())
+        if local:
+            self.workers[secret] = result = LocalWorker()
+            return result
+
+        self._start_loop()
         # we need to wait for the server to start serving
         # otherwise the new process will not be able to connect
         f = asyncio.run_coroutine_threadsafe(self.server_started.wait(), self.loop)
         f.result()
 
-        secret = str(uuid4())
         # if we were only ever going to use local processes then it would easier to just directly
         # create pipes, but this uses sockets so that we can add remote processes without changing the
         # setup.
