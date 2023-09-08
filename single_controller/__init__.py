@@ -175,21 +175,15 @@ class DTensor(BaseTensor):
 
     def to_local(self):
         worker = self._worker
-        return worker.request_values([self._ref], lambda x: x[0])
+        f = worker.request_value(self._ref)
+        async def wrap():
+            return await f
+        return worker.manager.schedule(wrap())
 
     def __del__(self):
         if sys is None:
             return # pytho shutdown
         self._worker.del_value(self._ref)
-
-
-def _run_void(co, loop):
-    async def wrap():
-        try:
-            await co
-        except:
-            traceback.print_exc()
-    asyncio.run_coroutine_threadsafe(wrap(), loop)
 
 
 # tree_flatten but also take a condition about which non-tree values we care about
@@ -202,19 +196,19 @@ def flatten(tree, cond):
 
 class Manager:
     def __init__(self):
+        self.loop = asyncio.get_event_loop()
         self.workers = {} # uuid -> Worker
 
     def _start_loop(self):
-        if hasattr(self, 'loop'):
+        if hasattr(self, 'thread'):
             return
         self.host = "127.0.0.1"
         self.port = 12345
-        self.loop = asyncio.get_event_loop()
         self.shutdown_event = asyncio.Event()
         self.thread = threading.Thread(target=lambda: self.loop.run_until_complete(self.shutdown_event.wait()), daemon=True)
         self.thread.start()
         atexit.register(self.complete)
-        _run_void(self.accept_new_connections(), self.loop)
+        self.schedule_void(self.accept_new_connections())
         self.server_started = asyncio.Event()
 
     async def accept_new_connections(self):
@@ -233,21 +227,40 @@ class Manager:
     def create_worker(self, local=False):
         secret = str(uuid4())
         if local:
-            self.workers[secret] = result = LocalWorker()
+            self.workers[secret] = result = LocalWorker(self)
             return result
 
         self._start_loop()
         # we need to wait for the server to start serving
         # otherwise the new process will not be able to connect
-        f = asyncio.run_coroutine_threadsafe(self.server_started.wait(), self.loop)
+        f = self.schedule(self.server_started.wait())
         f.result()
 
         # if we were only ever going to use local processes then it would easier to just directly
         # create pipes, but this uses sockets so that we can add remote processes without changing the
         # setup.
-        self.workers[secret] = result = Worker(self.loop)
+        self.workers[secret] = result = Worker(self)
         result.proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret])
         return result
+
+    def schedule_void(self, co):
+        async def wrap():
+            try:
+                await co
+            except:
+                traceback.print_exc()
+        self.schedule(wrap())
+
+    def schedule(self, awaitable):
+        if hasattr(self, 'thread'):
+            return asyncio.run_coroutine_threadsafe(awaitable, self.loop)
+        else:
+            # if we only have local workers
+            r = self.loop.run_until_complete(awaitable)
+            f = Future()
+            f.set_result(r)
+            return f
+
 
     def complete(self):
         if _last_event is not None:
@@ -258,7 +271,7 @@ class Manager:
                 worker.commands_to_send.append(b)
                 await worker._notify_new_commands()
             self.shutdown_event.set()
-        _run_void(shutdown(), self.loop)
+        self.schedule_void(shutdown())
         for worker in self.workers.values():
             worker.proc.wait()
 
@@ -279,11 +292,15 @@ Future.wait = Future.result
 def to_local(obj):
     flat, unflatten = flatten(obj, lambda x: isinstance(x, DTensor))
     w = flat[0]._worker
-    return w.request_values([f._ref for f in flat], unflatten)
+    manager = w.manager
+    futures = [f._worker.request_value(f._ref) for f in flat]
+    async def wrap():
+        return unflatten([await f for f in futures])
+    return manager.schedule(wrap())
 
 class Worker:
-    def __init__(self, loop):
-        self.loop = loop
+    def __init__(self, manager):
+        self.manager = manager
         self._dumps = pickle.dumps
         self._loads = pickle.loads
         self.new_commands = asyncio.Condition()
@@ -324,26 +341,25 @@ class Worker:
     def _write_pickle(self, obj, future=None):
         b = self._dumps(obj)
         self.commands_to_send.append(b)
-        _run_void(self._notify_new_commands(), self.loop)
+        self.manager.schedule_void(self._notify_new_commands())
 
     async def _notify_new_commands(self):
         async with self.new_commands:
             self.new_commands.notify()
 
-    def request_values(self, requests: List[DTensorRef], postprocess):
-        futures = [self.loop.create_future() for _ in requests]
-        self.pending_futures.extend(futures)
-        self.commands_to_send.extend([self._dumps(('request_value', r)) for r in requests])
-        async def run():
-            await self._notify_new_commands()
-            return postprocess(await asyncio.gather(*futures))
-        return asyncio.run_coroutine_threadsafe(run(), self.loop)
+    def request_value(self, request: DTensorRef) -> 'asyncio.Future[torch.Tensor]':
+        f = self.manager.loop.create_future()
+        self.pending_futures.append(f)
+        self.commands_to_send.append(self._dumps(('request_value', request)))
+        self.manager.schedule_void(self._notify_new_commands())
+        return f
 
 class LocalWorker:
     """
     Run in the local process rather than remotely
     """
-    def __init__(self):
+    def __init__(self, manager):
+        self.manager = manager
         self.ref_to_tensor = {}
     def send_command(self, func, args, kwargs, results):
         def get_tensor(t):
@@ -359,16 +375,10 @@ class LocalWorker:
         for real, ref in zip(real_results, results):
             self.ref_to_tensor[ref.id] = real
 
-    def request_values(self, refs: List[DTensorRef], postprocess):
-        f = Future()
-        f.set_result(postprocess([self.ref_to_tensor[ref.id] for ref in refs]))
+    def request_value(self, ref: DTensorRef):
+        f = self.manager.loop.create_future()
+        f.set_result(self.ref_to_tensor[ref.id])
         return f
-
-    def wait_one(self):
-        pass
-
-    def wait_all(self):
-        pass
 
     def send_value(self, ref: DTensorRef, value: torch.Tensor):
         self.ref_to_tensor[ref.id] = value
@@ -376,12 +386,6 @@ class LocalWorker:
     def del_value(self, ref: DTensorRef):
         del self.ref_to_tensor[ref.id]
 
-    # HACKS: event loop functions to make Future object happy
-    def call_soon(self, callback, *args, context):
-        context.run(callback, *args)
-
-    def get_debug(self):
-        return False
 
 class WorkerMesh:
     """

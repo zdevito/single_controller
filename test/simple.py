@@ -1,7 +1,7 @@
 from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local
 import torch
 m = Manager()
-w = m.create_worker(local=False)
+w = m.create_worker(local=True)
 
 x = DTensor.to_remote(torch.ones(2, 2), sharding=w)
 xx = x.add(x).add(x).max(dim=0)
