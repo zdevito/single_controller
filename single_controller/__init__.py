@@ -6,7 +6,7 @@ from contextlib import contextmanager, nullcontext
 from .base_tensor import BaseTensor
 from socket import socket, AF_INET, SOCK_STREAM
 from uuid import uuid4
-from subprocess import Popen
+from subprocess import Popen, PIPE
 import sys
 import pickle
 import asyncio
@@ -14,6 +14,7 @@ import threading
 from concurrent.futures import Future
 import traceback
 import atexit
+from functools import cache
 
 from torch._subclasses.fake_tensor import FakeTensorMode
 fake_mode = FakeTensorMode()
@@ -28,8 +29,41 @@ class RemoteRef:
         return f"RemoteRef({self.id})"
 
 
+def is_tensor(x):
+    return isinstance(x, torch.Tensor)
+
+
+def propagate_sharding(func, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
+    # totally fake for now, propagates the sharding pointwise if all the input shardings are the same or an input is fully replicated.
+    # will kinda do a ddp like thing (batch stays batched, weights stay replicated), but some ops would be unsafe
+    if not dtensor_input:
+        assert sharding_context
+        for r in dtensor_results:
+            r._sharding = sharding_context
+        return sharding_context.mesh
+    assert sharding_context is None
+    mesh = dtensor_input[0]._sharding.mesh
+    new_annotations = None
+    for d in dtensor_input:
+        if d._sharding.mesh is not mesh:
+            raise NotImplementedError("operation on tensors distributed on different device meshes")
+        if any(s != 'r' for s in d._sharding.sharding):
+            if new_annotations is None:
+                new_annotations = d._sharding.sharding
+            elif d._sharding.sharding != new_annotations:
+                raise NotImplementedError(f"mixed sharding annotations: {new_annotations} != {d._sharding.sharding}")
+    if new_annotations is None:
+        sharding = dtensor_input[0]._sharding
+    else:
+        sharding = Sharding(mesh, new_annotations)
+    for r in dtensor_results:
+        r._sharding = sharding
+    return sharding.mesh
+
+
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     worker = sharding.mesh.workers[0] if sharding else None
+
     def stringify(t):
         if isinstance(t, DTensor):
             return 'DTensor'
@@ -38,41 +72,28 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
         else:
             return t
 
-    def unwrap_fake(t):
-        nonlocal worker, sharding
-        if isinstance(t, DTensor):
-            if worker is None:
-                worker = t._worker
-                sharding = t._sharding
-            elif worker is not t._worker:
-                raise NotImplementedError("mixed workers")
-            return t._fake
-        elif isinstance(t, torch.Tensor):
-            raise NotImplementedError(f"mixed DTensor/local tensor {func}(args={tree_map(stringify, args)} kwargs={tree_map(stringify, kwargs)})")
-        else:
-            return t
-    def unwrap_ref(t):
-        if isinstance(t, DTensor):
-            return t._ref
-        else:
-            return t
+    def is_dtensor_no_tensors(x):
+        if isinstance(x, DTensor):
+            return True
+        elif isinstance(x, torch.Tensor):
+            raise NotImplementedError(f"mixed DTensor/local tensor {func}(args, kwargs)={tree_map(stringify, (args, kwargs))}")
 
-    fake_args = tree_map(unwrap_fake, args)
-    fake_kwargs = tree_map(unwrap_fake, kwargs)
-
-    ref_args = tree_map(unwrap_ref, args)
-    ref_kwargs = tree_map(unwrap_ref, kwargs)
+    dtensors, unflatten = flatten((args, kwargs), is_dtensor_no_tensors)
 
     with fake_mode:
+        fake_args, fake_kwargs = unflatten([d._fake for d in dtensors])
         result = func(*fake_args, **fake_kwargs)
-    flat, spec = tree_flatten(result)
-    flat_fake_tensors = [e for e in flat if isinstance(e, torch.Tensor)]
-    flat_tensor_refs = [RemoteRef() for _ in flat_fake_tensors]
 
-    flat_results = iter(DTensor(fake, ref, sharding) for fake, ref in zip(flat_fake_tensors, flat_tensor_refs))
-    worker.send_command(func, ref_args, ref_kwargs, flat_tensor_refs)
-    to_unflatten = [next(flat_results) if isinstance(e, torch.Tensor) else e for e in flat]
-    results = tree_unflatten(to_unflatten, spec)
+
+    fake_result_dtensors, unflatten_result = flatten(result, is_tensor)
+    result_dtensors = [DTensor(fake, RemoteRef(), None) for fake in fake_result_dtensors]
+    mesh = propagate_sharding(func, dtensors, result_dtensors, sharding)
+
+    ref_args, ref_kwargs = unflatten([d._ref for d in dtensors])
+    ref_results = [r._ref for r in result_dtensors]
+    for worker in mesh.workers:
+        worker.send_command(func, ref_args, ref_kwargs, ref_results)
+    results = unflatten_result(result_dtensors)
     return results
 
 
@@ -129,7 +150,7 @@ class DTensor(BaseTensor):
         cls,
         fake: torch.Tensor,
         ref: RemoteRef,
-        sharding: 'Sharding',
+        sharding: 'Optional[Sharding]',
     ):
         r = torch.Tensor._make_wrapper_subclass(
             cls,
@@ -143,7 +164,7 @@ class DTensor(BaseTensor):
         )
         r._ref = ref
         r._fake = fake
-        assert isinstance(sharding, Sharding)
+        assert sharding is None or isinstance(sharding, Sharding)
         r._sharding = sharding
         return r
 
@@ -155,8 +176,29 @@ class DTensor(BaseTensor):
         sharding = Sharding.lift(sharding)
         f = fake_mode.from_tensor(t)
         r = RemoteRef()
+
         result = DTensor(f, r, sharding)
-        result._worker.send_value(r, t)
+        shape = sharding.mesh.shape
+
+        for i, ann in enumerate(sharding.sharding):
+            if ann == "r":
+                t = t.expand(shape.size(i), *t.size())
+                t = t.movedim(0, i)
+            elif isinstance(ann, int):
+                sizes = t.size()
+                ann_adjusted = ann + i
+                d = sizes[ann_adjusted]
+                assert d % shape.size(i) == 0, "NOT EVENLY SPLIT"
+                t = t.reshape(sizes[:ann_adjusted], shape.size(i), d / shape.size(i), sizes[ann_adjusted+1:])
+                t = t.movedim(ann_adjusted, i)
+            else:
+                raise NotImplementedError(f"Annotation: {ann}")
+        t = t.flatten(0, shape.dim() - 1)
+        shape_flat = shape.flatten()
+        for idx, local in zip(shape_flat, t):
+            worker = sharding.mesh.workers[idx]
+            worker.send_value(r, local)
+
         return result
 
     def __repr__(self):
@@ -168,26 +210,45 @@ class DTensor(BaseTensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         return dtensor_dispatch(func, args, kwargs)
 
-    @property
-    def _worker(self):
-        # all the sharding is fake for now...
-        return self._sharding.mesh.workers[0]
-
     def to_local(self):
-        worker = self._worker
-        f = worker.request_value(self._ref)
-        async def wrap():
-            return await f
-        return worker.manager.schedule(wrap())
+        return self._sharding.manager.schedule(reconstruct_tensor(self))
 
     def __del__(self):
         if sys is None:
             return # pytho shutdown
-        self._worker.del_value(self._ref)
+        for worker in self._sharding.mesh.workers:
+            worker.del_value(self._ref)
 
+def reconstruct_tensor(dtensor):
+    annotations, mesh = dtensor._sharding.sharding, dtensor._sharding.mesh
+    dims = []
+    mesh_indexing = []
+    for a in annotations:
+        if a == 'r':
+            mesh_indexing.append(0)
+        elif isinstance(a, int):
+            mesh_indexing.append(slice())
+            dims.append(a)
+        else:
+            NotImplementedError(f"Annotation {a}")
+    mesh = mesh[mesh_indexing]
+    futures = [mesh.workers[idx].request_value(dtensor._ref) for idx in mesh.shape.flatten()]
+
+    async def reconstruct():
+        local_value = torch.stack([await f for f in futures])
+        local_value = local_value.reshape(*mesh.shape.size(), *local_value.size()[1:])
+        for i, d  in enumerate(dims):
+            adjusted_dim = d + (len(dims) - i)
+            local_value = local_value.movedim(0, adjusted_dim)
+            local_value = local_value.flatten(adjusted_dim, adjusted_dim + 1)
+        return local_value
+    return reconstruct()
+
+def is_dtensor(x):
+    return isinstance(x, DTensor)
 
 # tree_flatten but also take a condition about which non-tree values we care about
-def flatten(tree, cond):
+def flatten(tree, cond=is_dtensor):
     r, spec = tree_flatten(tree)
     def unflatten(n):
         n_it = iter(n)
@@ -290,12 +351,12 @@ Future.then = _then
 Future.wait = Future.result
 
 def to_local(obj):
-    flat, unflatten = flatten(obj, lambda x: isinstance(x, DTensor))
-    w = flat[0]._worker
-    manager = w.manager
-    futures = [f._worker.request_value(f._ref) for f in flat]
+    flat, unflatten = flatten(obj)
+    reconstructs = [reconstruct_tensor(f) for f in flat]
+    manager = flat[0]._sharding.manager
     async def wrap():
-        return unflatten([await f for f in futures])
+        local_tensors = await asyncio.gather(*reconstructs)
+        return unflatten(local_tensors)
     return manager.schedule(wrap())
 
 class Worker:
@@ -402,6 +463,9 @@ class WorkerMesh:
     def __getitem__(self, elem):
         return WorkerMesh(self.workers, self.shape[elem])
 
+    def select(self, dim, index):
+        return WorkerMesh(self.workers, self.shape[index])
+
 
 class Sharding(NamedTuple):
     """
@@ -427,6 +491,7 @@ class Sharding(NamedTuple):
     # requires saying whether the remaining device mesh dimensions are
     # replicated or sharded.
     @staticmethod
+    @cache
     def lift(obj):
         if isinstance(obj, (LocalWorker,Worker)):
             mesh = WorkerMesh([obj]).reshape(())
@@ -436,6 +501,10 @@ class Sharding(NamedTuple):
         else:
             raise ValueError("expected Sharding")
 
+
+    @property
+    def manager():
+        return self.mesh.workers[0]
 
     def change(self, mesh=None, sharding=None):
         return Sharding(mesh=mesh if mesh else self.mesh, sharding=sharding if sharding else self.sharding)
