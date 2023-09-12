@@ -19,13 +19,13 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 fake_mode = FakeTensorMode()
 
 _next_handle = 0
-class DTensorRef:
+class RemoteRef:
     def __init__(self):
         global _next_handle
         _next_handle += 1
         self.id = _next_handle
     def __repr__(self):
-        return f"DTensorRef({self.id})"
+        return f"RemoteRef({self.id})"
 
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
@@ -67,7 +67,7 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
         result = func(*fake_args, **fake_kwargs)
     flat, spec = tree_flatten(result)
     flat_fake_tensors = [e for e in flat if isinstance(e, torch.Tensor)]
-    flat_tensor_refs = [DTensorRef() for _ in flat_fake_tensors]
+    flat_tensor_refs = [RemoteRef() for _ in flat_fake_tensors]
 
     flat_results = iter(DTensor(fake, ref, sharding) for fake, ref in zip(flat_fake_tensors, flat_tensor_refs))
     worker.send_command(func, ref_args, ref_kwargs, flat_tensor_refs)
@@ -128,7 +128,7 @@ class DTensor(BaseTensor):
     def __new__(
         cls,
         fake: torch.Tensor,
-        ref: DTensorRef,
+        ref: RemoteRef,
         sharding: 'Sharding',
     ):
         r = torch.Tensor._make_wrapper_subclass(
@@ -154,7 +154,7 @@ class DTensor(BaseTensor):
     def to_remote(cls, t: torch.Tensor, sharding: 'Sharding'):
         sharding = Sharding.lift(sharding)
         f = fake_mode.from_tensor(t)
-        r = DTensorRef()
+        r = RemoteRef()
         result = DTensor(f, r, sharding)
         result._worker.send_value(r, t)
         return result
@@ -332,10 +332,10 @@ class Worker:
     def send_command(self, func, args, kwargs, results):
         self._write_pickle(('send_command', PicklableFunc(func), args, kwargs, results))
 
-    def send_value(self, ref: DTensorRef, value: torch.Tensor):
+    def send_value(self, ref: RemoteRef, value: torch.Tensor):
         self._write_pickle(('send_value', ref, value))
 
-    def del_value(self, ref: DTensorRef):
+    def del_value(self, ref: RemoteRef):
         self._write_pickle(('del_value', ref))
 
     def _write_pickle(self, obj, future=None):
@@ -347,7 +347,7 @@ class Worker:
         async with self.new_commands:
             self.new_commands.notify()
 
-    def request_value(self, request: DTensorRef) -> 'asyncio.Future[torch.Tensor]':
+    def request_value(self, request: RemoteRef) -> 'asyncio.Future[torch.Tensor]':
         f = self.manager.loop.create_future()
         self.pending_futures.append(f)
         self.commands_to_send.append(self._dumps(('request_value', request)))
@@ -363,7 +363,7 @@ class LocalWorker:
         self.ref_to_tensor = {}
     def send_command(self, func, args, kwargs, results):
         def get_tensor(t):
-            if isinstance(t, DTensorRef):
+            if isinstance(t, RemoteRef):
                 return self.ref_to_tensor[t.id]
             else:
                 return t
@@ -375,15 +375,15 @@ class LocalWorker:
         for real, ref in zip(real_results, results):
             self.ref_to_tensor[ref.id] = real
 
-    def request_value(self, ref: DTensorRef):
+    def request_value(self, ref: RemoteRef):
         f = self.manager.loop.create_future()
         f.set_result(self.ref_to_tensor[ref.id])
         return f
 
-    def send_value(self, ref: DTensorRef, value: torch.Tensor):
+    def send_value(self, ref: RemoteRef, value: torch.Tensor):
         self.ref_to_tensor[ref.id] = value
 
-    def del_value(self, ref: DTensorRef):
+    def del_value(self, ref: RemoteRef):
         del self.ref_to_tensor[ref.id]
 
 

@@ -1,5 +1,5 @@
 from socket import AF_INET, SOCK_STREAM, socket
-from . import DTensorRef
+from . import RemoteRef
 import pickle
 import sys
 import torch
@@ -32,7 +32,7 @@ class LocalWorker:
 
     def send_command(self, func, args, kwargs, results):
         def get_tensor(t):
-            if isinstance(t, DTensorRef):
+            if isinstance(t, RemoteRef):
                 return self.ref_to_tensor[t.id]
             else:
                 return t
@@ -45,14 +45,14 @@ class LocalWorker:
             self.ref_to_tensor[ref.id] = real
         return no_response
 
-    def request_value(self, ref: DTensorRef):
+    def request_value(self, ref: RemoteRef):
         return self.ref_to_tensor[ref.id]
 
-    def send_value(self, ref: DTensorRef, value: torch.Tensor):
+    def send_value(self, ref: RemoteRef, value: torch.Tensor):
         self.ref_to_tensor[ref.id] = value
         return no_response
 
-    def del_value(self, ref: DTensorRef):
+    def del_value(self, ref: RemoteRef):
         del self.ref_to_tensor[ref.id]
         return no_response
 
