@@ -193,11 +193,17 @@ class DTensor(BaseTensor):
                 t = t.movedim(ann_adjusted, i)
             else:
                 raise NotImplementedError(f"Annotation: {ann}")
-        t = t.flatten(0, shape.dim() - 1)
-        shape_flat = shape.flatten()
-        for idx, local in zip(shape_flat, t):
-            worker = sharding.mesh.workers[idx]
-            worker.send_value(r, local)
+
+        if shape.dim() == 0:
+            worker = sharding.mesh.workers[shape.item()]
+            worker.send_value(r, t)
+        else:
+            t = t.flatten(0, shape.dim() - 1)
+            shape_flat = shape.flatten()
+            for idx, local in zip(shape_flat, t):
+                print(local)
+                worker = sharding.mesh.workers[idx]
+                worker.send_value(r, local)
 
         return result
 
@@ -231,12 +237,15 @@ def reconstruct_tensor(dtensor):
             dims.append(a)
         else:
             NotImplementedError(f"Annotation {a}")
-    mesh = mesh[mesh_indexing]
+    mesh = mesh[tuple(mesh_indexing)]
     futures = [mesh.workers[idx].request_value(dtensor._ref) for idx in mesh.shape.flatten()]
 
     async def reconstruct():
-        local_value = torch.stack([await f for f in futures])
-        local_value = local_value.reshape(*mesh.shape.size(), *local_value.size()[1:])
+        local_values = [await f for f in futures]
+        print(local_values)
+        local_value = torch.stack(local_values)
+        reshaped = (*mesh.shape.size(), *local_value.size()[1:])
+        local_value = torch.reshape(local_value, reshaped)
         for i, d  in enumerate(dims):
             adjusted_dim = d + (len(dims) - i)
             local_value = local_value.movedim(0, adjusted_dim)
@@ -328,13 +337,11 @@ class Manager:
             _last_event.wait()
         async def shutdown():
             for worker in self.workers.values():
-                b = pickle.dumps(('exit',))
-                worker.commands_to_send.append(b)
-                await worker._notify_new_commands()
+                await worker.request_exit()
             self.shutdown_event.set()
         self.schedule_void(shutdown())
         for worker in self.workers.values():
-            worker.proc.wait()
+            worker.wait()
 
 # monkey patch...
 _last_event = None
@@ -346,6 +353,10 @@ def _then(self, cb):
         cb(x.result())
         this_event.set()
     self.add_done_callback(run)
+
+def _debug_wait_pending_callbacks():
+    if _last_event is not None:
+            _last_event.wait()
 
 Future.then = _then
 Future.wait = Future.result
@@ -415,6 +426,15 @@ class Worker:
         self.manager.schedule_void(self._notify_new_commands())
         return f
 
+    def wait(self):
+        self.proc.wait()
+
+    def request_exit(self):
+        b = pickle.dumps(('exit',))
+        self.commands_to_send.append(b)
+        return self._notify_new_commands()
+
+
 class LocalWorker:
     """
     Run in the local process rather than remotely
@@ -446,6 +466,15 @@ class LocalWorker:
 
     def del_value(self, ref: RemoteRef):
         del self.ref_to_tensor[ref.id]
+
+    def request_exit(self):
+        async def noop():
+            pass
+        return noop()
+
+    def wait(self):
+        pass
+
 
 
 class WorkerMesh:
@@ -503,8 +532,8 @@ class Sharding(NamedTuple):
 
 
     @property
-    def manager():
-        return self.mesh.workers[0]
+    def manager(self):
+        return self.mesh.workers[0].manager
 
     def change(self, mesh=None, sharding=None):
         return Sharding(mesh=mesh if mesh else self.mesh, sharding=sharding if sharding else self.sharding)
