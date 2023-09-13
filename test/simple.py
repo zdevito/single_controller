@@ -2,6 +2,7 @@ import torch
 from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks, Sharding, WorkerMesh
 import unittest
 from torch.testing import assert_close
+import subprocess
 manager = Manager()
 local_workers, workers = None, None
 
@@ -106,6 +107,13 @@ class TestRemote(TestLocal):
             workers = [manager.create_worker(local=False) for i in range(4)]
         self.w = workers[0]
         self.workers = workers
+
+    def test_devices(self):
+        mesh = WorkerMesh([manager.create_worker(0), manager.create_worker(1)])
+        sharding = Sharding(mesh, [0])
+        r = DTensor.to_remote(torch.rand(4, 2), sharding)
+        r = r.cuda()
+        rl = r.cpu().to_local().wait()
 
 if __name__ == '__main__':
     unittest.main()

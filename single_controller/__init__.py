@@ -15,6 +15,7 @@ from concurrent.futures import Future
 import traceback
 import atexit
 from functools import cache
+import os
 
 from torch._subclasses.fake_tensor import FakeTensorMode
 fake_mode = FakeTensorMode()
@@ -292,11 +293,18 @@ class Manager:
         worker = self.workers[secret]
         await worker.connect(reader, writer)
 
-    def create_worker(self, local=False):
+    def create_worker(self, devices=None, local=False):
         secret = str(uuid4())
         if local:
+            assert devices is None, "devices can only be set for real processes"
             self.workers[secret] = result = LocalWorker(self)
             return result
+        env = os.environ.copy()
+        if devices is not None:
+            if isinstance(devices, int):
+                devices = [devices]
+            env['CUDA_VISIBLE_DEVICES'] = ','.join(str(d) for d in devices)
+
 
         self._start_loop()
         # we need to wait for the server to start serving
@@ -308,7 +316,7 @@ class Manager:
         # create pipes, but this uses sockets so that we can add remote processes without changing the
         # setup.
         self.workers[secret] = result = Worker(self)
-        result.proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret])
+        result.proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret], env=env)
         return result
 
     def schedule_void(self, co):
