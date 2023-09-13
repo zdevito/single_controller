@@ -189,7 +189,7 @@ class DTensor(BaseTensor):
                 ann_adjusted = ann + i
                 d = sizes[ann_adjusted]
                 assert d % shape.size(i) == 0, "NOT EVENLY SPLIT"
-                t = t.reshape(sizes[:ann_adjusted], shape.size(i), d / shape.size(i), sizes[ann_adjusted+1:])
+                t = t.reshape(*sizes[:ann_adjusted], shape.size(i), d // shape.size(i), *sizes[ann_adjusted+1:])
                 t = t.movedim(ann_adjusted, i)
             else:
                 raise NotImplementedError(f"Annotation: {ann}")
@@ -201,7 +201,6 @@ class DTensor(BaseTensor):
             t = t.flatten(0, shape.dim() - 1)
             shape_flat = shape.flatten()
             for idx, local in zip(shape_flat, t):
-                print(local)
                 worker = sharding.mesh.workers[idx]
                 worker.send_value(r, local)
 
@@ -233,7 +232,7 @@ def reconstruct_tensor(dtensor):
         if a == 'r':
             mesh_indexing.append(0)
         elif isinstance(a, int):
-            mesh_indexing.append(slice())
+            mesh_indexing.append(slice(None))
             dims.append(a)
         else:
             NotImplementedError(f"Annotation {a}")
@@ -242,12 +241,11 @@ def reconstruct_tensor(dtensor):
 
     async def reconstruct():
         local_values = [await f for f in futures]
-        print(local_values)
         local_value = torch.stack(local_values)
         reshaped = (*mesh.shape.size(), *local_value.size()[1:])
         local_value = torch.reshape(local_value, reshaped)
         for i, d  in enumerate(dims):
-            adjusted_dim = d + (len(dims) - i)
+            adjusted_dim = d + (len(dims) - i - 1)
             local_value = local_value.movedim(0, adjusted_dim)
             local_value = local_value.flatten(adjusted_dim, adjusted_dim + 1)
         return local_value
@@ -486,8 +484,8 @@ class WorkerMesh:
         self.workers = workers
         self.shape = torch.arange(len(self.workers)) if shape is None else shape
 
-    def reshape(self, dims: List[int]):
-        return WorkerMesh(self.workers, self.shape.reshape(dims))
+    def reshape(self, *dims):
+        return WorkerMesh(self.workers, self.shape.reshape(*dims))
 
     def __getitem__(self, elem):
         return WorkerMesh(self.workers, self.shape[elem])
@@ -520,16 +518,19 @@ class Sharding(NamedTuple):
     # requires saying whether the remaining device mesh dimensions are
     # replicated or sharded.
     @staticmethod
-    @cache
     def lift(obj):
         if isinstance(obj, (LocalWorker,Worker)):
-            mesh = WorkerMesh([obj]).reshape(())
-            return Sharding(mesh=mesh, sharding = [])
+            return Sharding._singleton_mesh(obj)
         elif isinstance(obj, Sharding):
             return obj
         else:
             raise ValueError("expected Sharding")
 
+    @staticmethod
+    @cache
+    def _singleton_mesh(worker):
+        mesh = WorkerMesh([worker]).reshape(())
+        return Sharding(mesh=mesh, sharding = [])
 
     @property
     def manager(self):

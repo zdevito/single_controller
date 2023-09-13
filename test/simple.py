@@ -1,16 +1,17 @@
 import torch
-from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks
+from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks, Sharding, WorkerMesh
 import unittest
-
+from torch.testing import assert_close
 manager = Manager()
-local_worker, worker = None, None
+local_workers, workers = None, None
 
 class TestLocal(unittest.TestCase):
     def setUp(self):
-        global local_worker
-        if local_worker is None:
-            local_worker = manager.create_worker(local=True)
-        self.w = local_worker
+        global local_workers
+        if local_workers is None:
+            local_workers = [manager.create_worker(local=True) for _ in range(4)]
+        self.w = local_workers[0]
+        self.workers = local_workers
 
     def test_operations(self):
         x = DTensor.to_remote(torch.ones(2, 2), sharding=self.w)
@@ -18,7 +19,7 @@ class TestLocal(unittest.TestCase):
         xx = xx.add(x).max(dim=0)
         f = xx[0].to_local()
 
-        self.assertTrue(torch.allclose(torch.ones(2)*3, f.wait()))
+        assert_close(torch.ones(2)*3, f.wait())
 
         with active_sharding(sharding=self.w):
             o = torch.ones(2) + x
@@ -27,7 +28,7 @@ class TestLocal(unittest.TestCase):
         self.assertEqual(f.wait().dim(), 1)
 
         lo.then(lambda f: print("CB", f))
-        self.assertTrue(torch.allclose(lo.wait(), torch.ones(2, 2) * 2))
+        assert_close(lo.wait(), torch.ones(2, 2) * 2)
 
         saw = False
         def print_and_mark(x):
@@ -50,13 +51,49 @@ class TestLocal(unittest.TestCase):
         x = DTensor.to_remote(torch.ones(2, 2), sharding=self.w).to_local().wait()
         self.assertEqual(x.dim(), 2)
 
+    def test_two_workers(self):
+        mesh = WorkerMesh(self.workers[0:2])
+        sharding = Sharding(mesh, [0])
+        r = DTensor.to_remote(torch.arange(12).reshape(4, 3), sharding)
+        r = (r + r).sum(dim=1)
+        assert_close(r.to_local().wait(), (torch.arange(12).reshape(4, 3)*2).sum(dim=1))
+
+        sharding = Sharding(mesh, [1])
+
+        r = DTensor.to_remote(torch.arange(12).reshape(3, 4), sharding)
+        r = (r + r).sum(dim=0, keepdim=True)
+        self.assertTrue(torch.allclose(r.to_local().wait(), (torch.arange(12).reshape(3, 4)*2).sum(dim=0, keepdim=True)))
+
+    def test_four_workers(self):
+        mesh = WorkerMesh(self.workers[0:4]).reshape(2, 2)
+        sharding = Sharding(mesh, [2, 0])
+        inp = torch.arange(4*5*4).reshape(4, 5, 4)
+        r = DTensor.to_remote(inp, sharding)
+        out = r.to_local().wait()
+        self.assertTrue(torch.allclose(inp, out))
+        self.assertTrue(torch.allclose(inp + inp, (r + r).to_local().wait()))
+
+    def test_replicated(self):
+        mesh = WorkerMesh(self.workers[0:2])
+        rep = Sharding(mesh, ['r'])
+        split = Sharding(mesh, [0])
+        W = torch.rand(3, 4)
+        I = torch.rand(6, 3)
+        Wr = DTensor.to_remote(W, rep)
+        Ir = DTensor.to_remote(I, split)
+        O = I @ W
+        Or = Ir @ Wr
+        assert_close(Or.to_local().wait(), O)
+        assert_close(Wr.to_local().wait(), W)
+
 
 class TestRemote(TestLocal):
     def setUp(self):
-        global worker
-        if worker is None:
-            worker = manager.create_worker(local=False)
-        self.w = worker
+        global workers
+        if workers is None:
+            workers = [manager.create_worker(local=False) for i in range(4)]
+        self.w = workers[0]
+        self.workers = workers
 
 if __name__ == '__main__':
     unittest.main()

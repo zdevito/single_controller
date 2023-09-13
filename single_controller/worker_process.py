@@ -22,7 +22,7 @@ class LocalWorker:
     def run(self):
         while True:
             method, *args = self._read_pickle()
-            print("method:", method, args)
+            # print("method:", method, args)
             if method == 'exit':
                 return
             result = getattr(self, method)(*args)
