@@ -86,6 +86,18 @@ class TestLocal(unittest.TestCase):
         assert_close(Or.to_local().wait(), O)
         assert_close(Wr.to_local().wait(), W)
 
+    def test_shardreplicate(self):
+        mesh = WorkerMesh(self.workers[0:4]).reshape(2, 2)
+        rep = Sharding(mesh, ['r', 'r'])
+        split = Sharding(mesh, [0, 'r'])
+        W = torch.rand(3, 4)
+        I = torch.rand(6, 3)
+        Wr = DTensor.to_remote(W, rep)
+        Ir = DTensor.to_remote(I, split)
+        O = I @ W
+        Or = Ir @ Wr
+        assert_close(Or.to_local().wait(), O)
+        assert_close(Wr.to_local().wait(), W)
 
 class TestRemote(TestLocal):
     def setUp(self):
