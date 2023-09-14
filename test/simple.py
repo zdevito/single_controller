@@ -100,11 +100,21 @@ class TestLocal(unittest.TestCase):
         assert_close(Or.to_local().wait(), O)
         assert_close(Wr.to_local().wait(), W)
 
+    def test_partial(self):
+        mesh = WorkerMesh(self.workers[0:2])
+        for d in range(2):
+            sharded = Sharding(mesh, [d])
+            tl = torch.arange(4*6).reshape(4, 6)
+            t = sharded.from_local(tl).cuda()
+            t = t.sum(dim=d)
+            ts = t.to_sharding_('r').cpu().to_local().wait()
+            assert_close(tl.sum(dim=d), ts)
+
 class TestRemote(TestLocal):
     def setUp(self):
         global workers
         if workers is None:
-            workers = [manager.create_worker(local=False) for i in range(4)]
+            workers = [manager.create_worker(devices=i % 2, local=False) for i in range(4)]
         self.w = workers[0]
         self.workers = workers
 

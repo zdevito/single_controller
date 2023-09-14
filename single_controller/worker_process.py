@@ -66,6 +66,24 @@ class LocalWorker:
         sz = int.from_bytes(self.ifile.read(8), 'little')
         return pickle.loads(self.ifile.read(sz))
 
+    def create_process_group(self, rank, world_size, pg_ref):
+        torch.distributed.init_process_group('nccl', init_method='tcp://127.0.0.1:12346', rank=rank, world_size=world_size)
+        self.ref_to_tensor[pg_ref.id] = None
+        return no_response
+
+    def create_process_subgroup(self, orig_pg, participating_ranks, pg):
+        pg = self.ref_to_tensor[orig_pg.id]
+        assert pg is None, "subgroup must be created from default group..."
+        r = torch.distributed.new_group(ranks=participating_ranks, backend='nccl')
+        if pg is not None:
+            self.ref_to_tensor[pg.id] = r
+
+    def all_reduce(self, ref: RemoteRef, pg_ref: RemoteRef):
+        pg = self.ref_to_tensor[pg_ref.id]
+        t = self.ref_to_tensor[ref.id]
+        torch.distributed.all_reduce(t, group=pg)
+        return no_response
+
 if __name__ == "__main__":
     _, host, port, secret = sys.argv
     w = LocalWorker(host, port, secret)

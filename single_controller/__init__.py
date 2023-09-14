@@ -34,7 +34,27 @@ def is_tensor(x):
     return isinstance(x, torch.Tensor)
 
 
-def propagate_sharding(func, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
+prules = {}
+
+def prule(name):
+    def wrap(x):
+       prules[name] = x
+    return wrap
+
+@prule("aten.sum.dim_IntList")
+def rule(t, dims, keepdim=False, *, dtensor_results):
+    annotation_out = t.sharding.sharding.copy()
+    for d in dims:
+        try:
+            idx = annotation_out.index(d)
+            annotation_out[idx] = '+'
+        except ValueError:
+            pass
+    dtensor_results[0]._sharding = Sharding(t.sharding.mesh, annotation_out)
+
+def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
+    key = str(func)
+    # print("PROPAGATE", key, args, kwargs)
     # totally fake for now, propagates the sharding pointwise if all the input shardings are the same or an input is fully replicated.
     # will kinda do a ddp like thing (batch stays batched, weights stay replicated), but some ops would be unsafe
     if not dtensor_input:
@@ -44,6 +64,9 @@ def propagate_sharding(func, dtensor_input: 'List[DTensor]', dtensor_results: 'L
         return sharding_context.mesh
     assert sharding_context is None
     mesh = dtensor_input[0]._sharding.mesh
+    if key in prules:
+        prules[key](*args, **kwargs, dtensor_results=dtensor_results)
+        return mesh
     new_annotations = None
     for d in dtensor_input:
         if d._sharding.mesh is not mesh:
@@ -63,7 +86,7 @@ def propagate_sharding(func, dtensor_input: 'List[DTensor]', dtensor_results: 'L
 
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
-    worker = sharding.mesh.workers[0] if sharding else None
+    worker = sharding.mesh.flat_workers[0] if sharding else None
 
     def stringify(t):
         if isinstance(t, DTensor):
@@ -88,11 +111,11 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
 
     fake_result_dtensors, unflatten_result = flatten(result, is_tensor)
     result_dtensors = [DTensor(fake, RemoteRef(), None) for fake in fake_result_dtensors]
-    mesh = propagate_sharding(func, dtensors, result_dtensors, sharding)
+    mesh = propagate_sharding(func, args, kwargs, dtensors, result_dtensors, sharding)
 
     ref_args, ref_kwargs = unflatten([d._ref for d in dtensors])
     ref_results = [r._ref for r in result_dtensors]
-    for worker in mesh.workers:
+    for worker in mesh.flat_workers:
         worker.send_command(func, ref_args, ref_kwargs, ref_results)
     results = unflatten_result(result_dtensors)
     return results
@@ -196,21 +219,19 @@ class DTensor(BaseTensor):
                 raise NotImplementedError(f"Annotation: {ann}")
 
         if shape.dim() == 0:
-            worker = sharding.mesh.workers[shape.item()]
+            worker = sharding.mesh._workers.workers[shape.item()]
             worker.send_value(r, t)
         else:
             t = t.flatten(0, shape.dim() - 1)
             shape_flat = shape.flatten()
             for idx, local in zip(shape_flat, t):
-                worker = sharding.mesh.workers[idx]
+                worker = sharding.mesh._workers.workers[idx]
                 worker.send_value(r, local)
 
         return result
 
     def __repr__(self):
-        if self.grad_fn:
-            return f"DTensor(_handle={self._ref.id}, grad_fn={self.grad_fn})"
-        return f"DTensor(_ref={self._ref.id})"
+       return f"DTensor(id={self._ref.id}, sharding={self.sharding}, shape={list(self.shape)})"
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
@@ -222,8 +243,39 @@ class DTensor(BaseTensor):
     def __del__(self):
         if sys is None:
             return # pytho shutdown
-        for worker in self._sharding.mesh.workers:
+        for worker in self._sharding.mesh.flat_workers:
             worker.del_value(self._ref)
+
+    @property
+    def sharding(self):
+        return self._sharding
+
+    def to_sharding_(self, new_sharding):
+        if not isinstance(new_sharding, Sharding):
+            new_sharding = Sharding(self.sharding.mesh, new_sharding)
+        if self.sharding.mesh is not new_sharding.mesh:
+            raise NotImplementedError(f"Cross mesh transfer {self.sharding.mesh} is not {new_sharding.mesh}")
+        for i, (olda, newa) in enumerate(zip(self.sharding.sharding, new_sharding.sharding)):
+            if olda == newa:
+                continue
+            if newa == '+':
+                raise ValueError(f"unexpected introduction of partial sum {self.sharding.sharding} -> {new_sharding.sharding}")
+            if olda == '+' and newa == 'r':
+                # all reduce
+                pg = self.sharding.mesh._process_group(i)
+                for worker in self.sharding.mesh.flat_workers:
+                    worker.all_reduce(self._ref, pg)
+            elif olda == '+' and isinstance(newa, int):
+                # reduce scatter
+                raise NotImplementedError("Reduce scatter")
+            elif isinstance(olda, int) and newa == 'r':
+                raise NotImplementedError("all gather")
+            elif olda == "r" and isinstance(newa, int):
+                raise NotImplementedError("drop some value")
+        self._sharding = new_sharding
+        return self
+
+
 
 def reconstruct_tensor(dtensor):
     annotations, mesh = dtensor._sharding.sharding, dtensor._sharding.mesh
@@ -236,9 +288,9 @@ def reconstruct_tensor(dtensor):
             mesh_indexing.append(slice(None))
             dims.append(a)
         else:
-            NotImplementedError(f"Annotation {a}")
+            raise NotImplementedError(f"Annotation {a}")
     mesh = mesh[tuple(mesh_indexing)]
-    futures = [mesh.workers[idx].request_value(dtensor._ref) for idx in mesh.shape.flatten()]
+    futures = [worker.request_value(dtensor._ref) for worker in mesh.flat_workers]
 
     async def reconstruct():
         local_values = [await f for f in futures]
@@ -416,6 +468,15 @@ class Worker:
     def del_value(self, ref: RemoteRef):
         self._write_pickle(('del_value', ref))
 
+    def create_process_group(self, rank, worldsize, pg_ref):
+        self._write_pickle(('create_process_group', rank, worldsize, pg_ref))
+
+    def create_process_subgroup(self, orig_pg, participating_ranks, pg):
+        self._write_pickle(('create_process_subgroup', orig_pg, participating_ranks, pg))
+
+    def all_reduce(self, ref: RemoteRef, pg_ref: RemoteRef):
+        self._write_pickle(('all_reduce', ref, pg_ref))
+
     def _write_pickle(self, obj, future=None):
         b = self._dumps(obj)
         self.commands_to_send.append(b)
@@ -440,6 +501,11 @@ class Worker:
         self.commands_to_send.append(b)
         return self._notify_new_commands()
 
+class LocalProcessGroup(NamedTuple):
+    members: 'List[LocalWorker]'
+    values: 'List[torch.tensor]'
+
+_local_process_group_being_created = None
 
 class LocalWorker:
     """
@@ -457,6 +523,7 @@ class LocalWorker:
         args = tree_map(get_tensor, args)
         kwargs = tree_map(get_tensor, kwargs)
         result = func(*args, **kwargs)
+        # list of references picks out the tensors from the result
         flat_results, _ = tree_flatten(result)
         real_results = [e for e in flat_results if isinstance(e, torch.Tensor)]
         for real, ref in zip(real_results, results):
@@ -478,8 +545,52 @@ class LocalWorker:
             pass
         return noop()
 
+    def create_process_group(self, rank, worldsize, pg_ref):
+        global _local_process_group_being_created
+        if _local_process_group_being_created is None:
+            _local_process_group_being_created = LocalProcessGroup([], [])
+        self.ref_to_tensor[pg_ref.id] = _local_process_group_being_created
+        _local_process_group_being_created.members.append(self)
+        if len(_local_process_group_being_created.members) == worldsize:
+            _local_process_group_being_created = None
+
+    def create_process_subgroup(self, orig_pg, participating_ranks, pg):
+        if pg is None:
+            return
+        global _local_process_group_being_created
+        if _local_process_group_being_created is None:
+            _local_process_group_being_created = LocalProcessGroup([], [])
+        self.ref_to_tensor[pg_ref.id] = _local_process_group_being_created
+        _local_process_group_being_created.members.append(self)
+        if len(_local_process_group_being_created.members) == len(participating_ranks):
+            _local_process_group_being_created = None
+
+    def all_reduce(self, ref: RemoteRef, pg_ref: RemoteRef):
+        pg = self.ref_to_tensor[pg_ref.id]
+        t = self.ref_to_tensor[ref.id]
+        pg.values.append(t)
+        if len(pg.values) == len(pg.members):
+            r = torch.stack(pg.values).sum(dim=0)
+            for m in pg.members:
+                m.ref_to_tensor[ref.id] = r.clone()
+            pg.values.clear()
+
     def wait(self):
         pass
+
+
+class WorkerList:
+    def __init__(self, workers: List[Worker]):
+        self.workers = workers
+        self.pg = None
+
+    @property
+    def process_group(self):
+        if self.pg is None:
+            self.pg = RemoteRef()
+            for rank, worker in enumerate(self.workers):
+                worker.create_process_group(rank, len(self.workers), self.pg)
+        return self.pg
 
 
 
@@ -489,20 +600,43 @@ class WorkerMesh:
     Similar to the collective DTensor we have today
     """
     def __init__(self, workers: List[Worker], shape=None):
-        self.workers = workers
-        self.shape = torch.arange(len(self.workers)) if shape is None else shape
+        if not isinstance(workers, WorkerList):
+            workers = WorkerList(workers)
+        self._workers = workers
+        self.shape = torch.arange(len(workers.workers)) if shape is None else shape
+        self.dim_to_pg = {}
+
+    @property
+    def flat_workers(self):
+        return [self._workers.workers[idx.item()] for idx in self.shape.flatten()]
 
     def reshape(self, *dims):
-        return WorkerMesh(self.workers, self.shape.reshape(*dims))
+        return WorkerMesh(self._workers, self.shape.reshape(*dims))
 
     def __getitem__(self, elem):
-        return WorkerMesh(self.workers, self.shape[elem])
+        return WorkerMesh(self._workers, self.shape[elem])
 
     def select(self, dim, index):
-        return WorkerMesh(self.workers, self.shape[index])
+        return WorkerMesh(self._workers, self.shape[index])
 
+    def __repr__(self):
+        return f'Mesh<{"x".join(str(s) for s in self.shape.size())}>'
 
-class Sharding(NamedTuple):
+    def _process_group(self, dim: int):
+        if dim not in self.dim_to_pg:
+            if self.shape.dim() == 1:
+                assert dim == 0
+                self.dim_to_pg[dim] = self._workers.process_group
+            else:
+                pg = self.dim_to_pg[dim] = RemoteRef()
+                flat_shape = self.shape.movedim(dim, -1).flatten(0, -2)
+                for subgroup in flat_shape:
+                    ranks = [s.item() for item in subgroup]
+                    for i, w in enumerate(self._workers.workers):
+                        w.create_process_subgroup(self._workers.process_group, ranks, pg if i in ranks else None)
+        return self.dim_to_pg[dim]
+
+class Sharding:
     """
     A description of how a single tensor is sharded across devices.
     This is equivalent to our collective dtensor
@@ -525,6 +659,16 @@ class Sharding(NamedTuple):
     # device mesh dimension it correspond to, but it still
     # requires saying whether the remaining device mesh dimensions are
     # replicated or sharded.
+
+    def __init__(self, mesh, sharding):
+        self.mesh = mesh
+        self.sharding = sharding
+        if isinstance(self.sharding, (str, int)):
+            self.sharding = [self.sharding]
+
+    def __repr__(self):
+        return f"Sharding({self.mesh}, {self.sharding})"
+
     @staticmethod
     def lift(obj):
         if isinstance(obj, (LocalWorker,Worker)):
@@ -542,7 +686,10 @@ class Sharding(NamedTuple):
 
     @property
     def manager(self):
-        return self.mesh.workers[0].manager
+        return self.mesh.flat_workers[0].manager
 
     def change(self, mesh=None, sharding=None):
         return Sharding(mesh=mesh if mesh else self.mesh, sharding=sharding if sharding else self.sharding)
+
+    def from_local(self, t):
+        return DTensor.to_remote(t, self)
