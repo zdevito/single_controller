@@ -38,11 +38,16 @@ prules = {}
 
 def prule(name):
     def wrap(x):
-       prules[name] = x
+        if isinstance(name, str):
+            prules[name] = x
+        else:
+            for n in name:
+                prules[n] = x
     return wrap
 
 @prule("aten.sum.dim_IntList")
-def rule(t, dims, keepdim=False, *, dtensor_results):
+def rule(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    t, dims = args[0:2]
     annotation_out = t.sharding.sharding.copy()
     for d in dims:
         try:
@@ -51,38 +56,186 @@ def rule(t, dims, keepdim=False, *, dtensor_results):
         except ValueError:
             pass
     dtensor_results[0]._sharding = Sharding(t.sharding.mesh, annotation_out)
+    return args, kwargs
+
+@prule(['aten._to_copy.default', 'aten.detach.default', 'aten.split.Tensor', 'aten._scaled_dot_product_efficient_attention.default', 'aten.gelu.default', 'aten.native_dropout.default', 'aten.ones_like.default', 'aten.native_dropout_backward.default', 'aten.gelu_backward', 'aten.gelu_backward.default'])
+def same_as_input(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    a = dtensor_input[0]
+    for r in dtensor_results:
+        r._sharding = a._sharding
+    return args, kwargs
+
+@prule(['aten.zeros.default', 'aten.arange.start','aten.full.default'])
+def ctor(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    assert sharding_context, "No context for constructor?"
+    for r in dtensor_results:
+        r._sharding = sharding_context
+    return args, kwargs
+
+
+def _check_all(t, v):
+    assert all(s == v for s in t.sharding.sharding), f"all shardings must be {v}"
+def _check_not(t, v):
+    assert all(s != v for s in t.sharding.sharding), f"all shardings must not be {v}"
+
+@prule('aten.embedding.default')
+def embedding(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    weight, indices = args
+    _check_all(weight, 'r')
+    _check_not(indices, '+')
+    dtensor_results[0]._sharding = indices._sharding
+    return args, kwargs
+
+@prule('aten.native_layer_norm.default')
+def layer_norm(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    input = args[0]
+    _check_not(input, input.dim() - 1)
+    for r in dtensor_results:
+        r._sharding = input._sharding
+    return args, kwargs
+
+@prule('aten.native_layer_norm_backward.default')
+def layer_norm_backward(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    input = args[1]
+    dtensor_results[0]._sharding = input.sharding
+    dtensor_results[1]._sharding = Sharding(input.sharding.mesh, ['+'])
+    if len(dtensor_results) == 3:
+        dtensor_results[2]._sharding = Sharding(input.sharding.mesh, ['r'])
+    return args, kwargs
+
+@prule(['aten._log_softmax.default', 'aten.select.int', 'aten.cat.default'])
+def _log_softmax(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    input, dim = args[0:2]
+    _check_not(input, dim)
+    dtensor_results[0]._sharding = input._sharding
+    return args, kwargs
+
+@prule(['aten.cat.default'])
+def cat(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    inputs, dim = args[0:2]
+    for input in inputs:
+        _check_not(input, dim)
+    dtensor_results[0]._sharding = input._sharding
+    return args, kwargs
+
+
+@prule('aten.t.default')
+def t(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    s = args[0]
+    remap = {0: 1, 1: 0}
+    new_sharding_ann = [remap.get(x, x) for x in s.sharding.sharding]
+    dtensor_results[0]._sharding = Sharding(s.sharding.mesh, new_sharding_ann)
+    return args, kwargs
+
+@prule('aten.mean.default')
+def t(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    t = args[0]
+    _check_all(t, 'r')
+    dtensor_results[0]._sharding = t.sharding
+    return args, kwargs
+
+
+@prule('aten.transpose.int')
+def t(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    s, dim0, dim1 = args
+    remap = {dim0: dim1, dim1: dim0}
+    new_sharding_ann = [remap.get(x, x) for x in s.sharding.sharding]
+    dtensor_results[0]._sharding = Sharding(s.sharding.mesh, new_sharding_ann)
+    return args, kwargs
+
+@prule(['aten.view.default', 'aten._unsafe_view.default'])
+def view(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    t, size = args
+    # this is wrong in general, but works for our specific case
+    mesh_sizes = t.sharding.mesh.shape.size()
+    new_size = tuple(s // mesh_sizes[t.sharding.sharding.index(i)] if i in t.sharding.sharding else s for i, s in enumerate(size))
+    dtensor_results[0]._sharding = t.sharding
+    return (t, new_size), kwargs
+
+@prule('aten.mm.default')
+def mm(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    a, b = args
+    # special case the partial reduce until we have better generic sharding propagation rules
+    if a.sharding.sharding == [1] and b.sharding.sharding == [0]:
+        dtensor_results[0]._sharding = Sharding(a.sharding.mesh, ['+'])
+        return args, kwargs
+    _check_all(b, 'r')
+    _check_not(a, '+')
+    _check_not(a, 1)
+    dtensor_results[0]._sharding = a._sharding
+    return args, kwargs
+
+@prule('aten.copy_.default')
+def cp(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    dst, src = args[0:2]
+    assert dst.sharding.sharding == src.sharding.sharding, "same sharding"
+    return args, kwargs
+
+@prule('aten.nll_loss_forward.default')
+def nll_loss(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    print("LOSS ----------------------------------------------------------------------")
+    self, target = args[0:2]
+    assert self.sharding.sharding == target.sharding.sharding, "same sharding"
+    _check_not(self, '+')
+    for r in dtensor_results:
+        r._sharding = Sharding(self.sharding.mesh, ['+' for _ in self.sharding.sharding])
+    return args, kwargs
+
+
+@prule(['aten.nll_loss_backward.default',  'aten._log_softmax_backward_data.default'])
+def nll_loss(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    self = args[1]
+    dtensor_results[0]._sharding = self.sharding
+    return args, kwargs
+
+
+@prule(['aten.embedding_dense_backward.default'])
+def embedding_backward(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    gradOutput = args[0]
+    dtensor_results[0]._sharding = Sharding(gradOutput.sharding.mesh, '+')
+    return args, kwargs
+
+
+@cache
+def sharding_to_find(func, *args):
+    print("FAKE", str(func), func._schema)
+    print(*args)
 
 def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
     key = str(func)
-    # print("PROPAGATE", key, args, kwargs)
-    # totally fake for now, propagates the sharding pointwise if all the input shardings are the same or an input is fully replicated.
-    # will kinda do a ddp like thing (batch stays batched, weights stay replicated), but some ops would be unsafe
-    if not dtensor_input:
-        assert sharding_context
-        for r in dtensor_results:
-            r._sharding = sharding_context
-        return sharding_context.mesh
-    assert sharding_context is None
-    mesh = dtensor_input[0]._sharding.mesh
-    if key in prules:
-        prules[key](*args, **kwargs, dtensor_results=dtensor_results)
-        return mesh
-    new_annotations = None
+    mesh = dtensor_input[0]._sharding.mesh if dtensor_input else sharding_context.mesh
     for d in dtensor_input:
         if d._sharding.mesh is not mesh:
             raise NotImplementedError("operation on tensors distributed on different device meshes")
-        if any(s != 'r' for s in d._sharding.sharding):
-            if new_annotations is None:
-                new_annotations = d._sharding.sharding
-            elif d._sharding.sharding != new_annotations:
-                raise NotImplementedError(f"mixed sharding annotations: {new_annotations} != {d._sharding.sharding}")
-    if new_annotations is None:
-        sharding = dtensor_input[0]._sharding
+
+    if key in prules:
+        args, kwargs = prules[key](args, kwargs, dtensor_input=dtensor_input, dtensor_results=dtensor_results, sharding_context=sharding_context)
+        return mesh, args, kwargs
+
+    sharding_to_find(func, str(args), str(kwargs), str(dtensor_results))
+    # totally fake for now, propagates the sharding pointwise if all the input shardings are the same or an input is fully replicated.
+    # will kinda do a ddp like thing (batch stays batched, weights stay replicated), but some ops would be unsafe
+    if dtensor_input:
+        assert sharding_context is None
+        new_annotations = None
+        for d in dtensor_input:
+            if any(s != 'r' for s in d._sharding.sharding):
+                if new_annotations is None:
+                    new_annotations = d._sharding.sharding
+                elif d._sharding.sharding != new_annotations:
+                    raise NotImplementedError(f"mixed sharding annotations: {new_annotations} != {d._sharding.sharding}")
+        if new_annotations is None:
+            sharding = dtensor_input[0]._sharding
+        else:
+            sharding = Sharding(mesh, new_annotations)
     else:
-        sharding = Sharding(mesh, new_annotations)
+        assert sharding_context
+        sharding = sharding_context
+
     for r in dtensor_results:
         r._sharding = sharding
-    return sharding.mesh
+
+    return mesh, args, kwargs
 
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
@@ -105,15 +258,26 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     dtensors, unflatten = flatten((args, kwargs), is_dtensor_no_tensors)
 
     with fake_mode:
-        fake_args, fake_kwargs = unflatten([d._fake for d in dtensors])
+        fake_input_tensors=  [d._fake for d in dtensors]
+        fake_args, fake_kwargs = unflatten(fake_input_tensors)
         result = func(*fake_args, **fake_kwargs)
 
 
     fake_result_dtensors, unflatten_result = flatten(result, is_tensor)
-    result_dtensors = [DTensor(fake, RemoteRef(), None) for fake in fake_result_dtensors]
-    mesh = propagate_sharding(func, args, kwargs, dtensors, result_dtensors, sharding)
+    fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
 
-    ref_args, ref_kwargs = unflatten([d._ref for d in dtensors])
+    # sometimes operators return references to inputs, in which case the result should be the same DTensor object
+    # otherwise we create a new DTensor with a new RemoteRef for the result
+    result_dtensors = [dtensors[fake_map[id(fake)]] if id(fake) in fake_map else DTensor(fake, RemoteRef(), None) for fake in fake_result_dtensors]
+    mesh, modified_args, modified_kwargs = propagate_sharding(func, args, kwargs, dtensors, result_dtensors, sharding)
+
+    for i, r in enumerate(result_dtensors):
+        assert r._sharding is not None, f"sharding unset for output {i} of {str(func)} fake outputs: {fake_result_dtensors}"
+
+    def get_ref(x):
+        return x if not isinstance(x, DTensor) else x._ref
+
+    ref_args, ref_kwargs = tree_map(get_ref, modified_args), tree_map(get_ref, modified_kwargs)
     ref_results = [r._ref for r in result_dtensors]
     for worker in mesh.flat_workers:
         worker.send_command(func, ref_args, ref_kwargs, ref_results)
@@ -231,7 +395,7 @@ class DTensor(BaseTensor):
         return result
 
     def __repr__(self):
-       return f"DTensor(id={self._ref.id}, sharding={self.sharding}, shape={list(self.shape)})"
+       return f"DTensor(sharding={self.sharding}, shape={list(self.shape)})"
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
@@ -243,6 +407,8 @@ class DTensor(BaseTensor):
     def __del__(self):
         if sys is None:
             return # pytho shutdown
+        if self._sharding is None:
+            return # an error happening during construction and this wasn't initialized
         for worker in self._sharding.mesh.flat_workers:
             worker.del_value(self._ref)
 
@@ -667,7 +833,7 @@ class Sharding:
             self.sharding = [self.sharding]
 
     def __repr__(self):
-        return f"Sharding({self.mesh}, {self.sharding})"
+        return f"{self.sharding}"
 
     @staticmethod
     def lift(obj):
@@ -676,7 +842,7 @@ class Sharding:
         elif isinstance(obj, Sharding):
             return obj
         else:
-            raise ValueError("expected Sharding")
+            raise ValueError(f"expected Sharding: {obj}")
 
     @staticmethod
     @cache
