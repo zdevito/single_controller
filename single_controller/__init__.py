@@ -685,7 +685,7 @@ class Worker:
         while True:
             b = await r.read(8)
             sz = int.from_bytes(b, 'little')
-            obj = self._loads(await r.read(sz))
+            obj = self._loads(await r.readexactly(sz))
             f = self.pending_futures.pop(0)
             f.set_result(obj)
 
