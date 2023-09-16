@@ -18,7 +18,21 @@ from functools import cache
 import os
 
 from torch._subclasses.fake_tensor import FakeTensorMode
-fake_mode = FakeTensorMode()
+
+check_correctness_per_operator = False
+
+if check_correctness_per_operator:
+    class RealMode:
+        def from_tensor(self, t):
+            return t
+        def __enter__(self):
+            pass
+        def __exit__(self, *args):
+            pass
+
+    fake_mode = RealMode()
+else:
+    fake_mode = FakeTensorMode()
 
 _next_handle = 0
 class RemoteRef:
@@ -58,11 +72,31 @@ def rule(args, kwargs, dtensor_input, dtensor_results, sharding_context):
     dtensor_results[0]._sharding = Sharding(t.sharding.mesh, annotation_out)
     return args, kwargs
 
-@prule(['aten._to_copy.default', 'aten.detach.default', 'aten.split.Tensor', 'aten._scaled_dot_product_efficient_attention.default', 'aten.gelu.default', 'aten.native_dropout.default', 'aten.ones_like.default', 'aten.native_dropout_backward.default', 'aten.gelu_backward', 'aten.gelu_backward.default'])
+@prule('aten._scaled_dot_product_efficient_attention.default')
+def attension(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    a = dtensor_input[0]
+    dtensor_results[0]._sharding = a.sharding
+    dtensor_results[1]._sharding = a.sharding
+    dtensor_results[2]._sharding = Sharding(a.sharding.mesh, 'r')
+    dtensor_results[3]._sharding = Sharding(a.sharding.mesh, 'r')
+    return args, kwargs
+
+
+@prule(['aten._to_copy.default', 'aten.detach.default', 'aten.split.Tensor', 'aten.gelu.default', 'aten.native_dropout.default', 'aten.ones_like.default', 'aten.native_dropout_backward.default', 'aten.gelu_backward', 'aten.gelu_backward.default'])
 def same_as_input(args, kwargs, dtensor_input, dtensor_results, sharding_context):
     a = dtensor_input[0]
     for r in dtensor_results:
         r._sharding = a._sharding
+    return args, kwargs
+
+
+@prule('aten.ones_like.default')
+def same_as_input(args, kwargs, dtensor_input, dtensor_results, sharding_context):
+    a = dtensor_input[0]
+    if any(isinstance(x, int) for x in a.sharding.sharding):
+        dtensor_results[0]._sharding = a.sharding
+    else:
+        dtensor_results[0]._sharding = Sharding(a.sharding.mesh, 'r')
     return args, kwargs
 
 @prule(['aten.zeros.default', 'aten.arange.start','aten.full.default'])
@@ -173,12 +207,12 @@ def cp(args, kwargs, dtensor_input, dtensor_results, sharding_context):
 
 @prule('aten.nll_loss_forward.default')
 def nll_loss(args, kwargs, dtensor_input, dtensor_results, sharding_context):
-    print("LOSS ----------------------------------------------------------------------")
+    # print("LOSS ----------------------------------------------------------------------")
     self, target = args[0:2]
     assert self.sharding.sharding == target.sharding.sharding, "same sharding"
     _check_not(self, '+')
     for r in dtensor_results:
-        r._sharding = Sharding(self.sharding.mesh, ['+' for _ in self.sharding.sharding])
+        r._sharding = Sharding(self.sharding.mesh, ['+' if isinstance(x, int) else 'r' for x in self.sharding.sharding])
     return args, kwargs
 
 
@@ -192,14 +226,18 @@ def nll_loss(args, kwargs, dtensor_input, dtensor_results, sharding_context):
 @prule(['aten.embedding_dense_backward.default'])
 def embedding_backward(args, kwargs, dtensor_input, dtensor_results, sharding_context):
     gradOutput = args[0]
-    dtensor_results[0]._sharding = Sharding(gradOutput.sharding.mesh, '+')
+    if gradOutput.sharding.sharding[0] == 'r':
+        dtensor_results[0]._sharding = gradOutput.sharding
+    else:
+        dtensor_results[0]._sharding = Sharding(gradOutput.sharding.mesh, '+')
     return args, kwargs
 
 
 @cache
 def sharding_to_find(func, *args):
-    print("FAKE", str(func), func._schema)
-    print(*args)
+    pass
+    #print("FAKE", str(func), func._schema)
+    #print(*args)
 
 def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
     key = str(func)
@@ -258,10 +296,9 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     dtensors, unflatten = flatten((args, kwargs), is_dtensor_no_tensors)
 
     with fake_mode:
-        fake_input_tensors=  [d._fake for d in dtensors]
+        fake_input_tensors =  [d._fake for d in dtensors]
         fake_args, fake_kwargs = unflatten(fake_input_tensors)
         result = func(*fake_args, **fake_kwargs)
-
 
     fake_result_dtensors, unflatten_result = flatten(result, is_tensor)
     fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
@@ -282,6 +319,33 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     for worker in mesh.flat_workers:
         worker.send_command(func, ref_args, ref_kwargs, ref_results)
     results = unflatten_result(result_dtensors)
+
+    if check_correctness_per_operator:
+        key = str(func)
+        # print(key, args, kwargs)
+        if "_." in key:
+            for i, dtensor in enumerate(dtensors):
+                rem = dtensor.to_local().wait()
+                # print(dtensor._fake.sum(), rem.sum())
+                if torch.all(torch.isfinite(dtensor._fake)) and torch.all(torch.isfinite(rem)):
+                    torch.testing.assert_close(dtensor._fake, rem, atol=1e-03, rtol=1e-03)
+                else:
+                    pass #print("nonfinite present...")
+                # don't let small differences accumulate over time when correctness testing
+                dtensor._fake.copy_(rem)
+        for i, dtensor in enumerate(result_dtensors):
+            rem = dtensor.to_local().wait()
+            if 'aten._scaled_dot_product_efficient_attention.default' == key and i > 1:
+                break
+            # print(dtensor._fake.sum(), rem.sum())
+            if torch.all(torch.isfinite(dtensor._fake)) and torch.all(torch.isfinite(rem)):
+                torch.testing.assert_close(dtensor._fake, rem, atol=1e-03, rtol=1e-03)
+            else:
+                pass #print("nonfinite present...")
+            # don't let small differences accumulate over time when correctness testing
+            dtensor._fake.copy_(rem)
+
+
     return results
 
 
@@ -438,7 +502,14 @@ class DTensor(BaseTensor):
                 raise NotImplementedError("all gather")
             elif olda == "r" and isinstance(newa, int):
                 raise NotImplementedError("drop some value")
+
         self._sharding = new_sharding
+        if check_correctness_per_operator:
+            rem = self.to_local().wait()
+            torch.testing.assert_close(self._fake, rem, atol=1e-03, rtol=1e-03)
+            # don't let small differences accumulate over time when correctness testing
+            self._fake.copy_(rem)
+
         return self
 
 
@@ -450,7 +521,7 @@ def reconstruct_tensor(dtensor):
     for a in annotations:
         if a == 'r':
             mesh_indexing.append(0)
-        elif isinstance(a, int):
+        elif isinstance(a, int) or a == '+':
             mesh_indexing.append(slice(None))
             dims.append(a)
         else:
@@ -464,9 +535,13 @@ def reconstruct_tensor(dtensor):
         reshaped = (*mesh.shape.size(), *local_value.size()[1:])
         local_value = torch.reshape(local_value, reshaped)
         for i, d  in enumerate(dims):
-            adjusted_dim = d + (len(dims) - i - 1)
-            local_value = local_value.movedim(0, adjusted_dim)
-            local_value = local_value.flatten(adjusted_dim, adjusted_dim + 1)
+            if d == '+': # efficiency wise it is better to do all_reduce first, then transfer from 1
+                         # but this is useful for debugging
+                local_value = local_value.sum(dim=0)
+            else:
+                adjusted_dim = d + (len(dims) - i - 1)
+                local_value = local_value.movedim(0, adjusted_dim)
+                local_value = local_value.flatten(adjusted_dim, adjusted_dim + 1)
         return local_value
     return reconstruct()
 

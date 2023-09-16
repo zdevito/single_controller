@@ -107,7 +107,7 @@ class TestLocal(unittest.TestCase):
             tl = torch.arange(4*6).reshape(4, 6)
             t = sharded.from_local(tl).cuda()
             t = t.sum(dim=d)
-            ts = t.to_sharding_('r').cpu().to_local().wait()
+            ts = t.cpu().to_local().wait()
             assert_close(tl.sum(dim=d), ts)
 
 class TestRemote(TestLocal):
