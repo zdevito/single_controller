@@ -320,7 +320,7 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     if _trace is not None:
         m, cmds = _trace
         assert m is mesh, "multiple compiled mesh NYI"
-        cmds.append((PicklableFunc(func), ref_args, ref_kwargs, ref_results))
+        cmds.append((func, ref_args, ref_kwargs, ref_results))
     else:
         for worker in mesh.flat_workers:
             worker.send_command(func, ref_args, ref_kwargs, ref_results)
@@ -756,11 +756,11 @@ class Worker:
         self.commands_to_send.append(b)
         return self._notify_new_commands()
 
-    def define_function(self, fn, commands, formals):
-        self._write_pickle(('define_function', fn, commands, formals))
+    def define_function(self, fn, code):
+        self._write_pickle(('define_function', fn, code))
 
-    def run_function(self, fn, actuals):
-        self._write_pickle(('run_function', fn, actuals))
+    def run_function(self, fn, arguments, results):
+        self._write_pickle(('run_function', fn, arguments, results))
 
 class LocalProcessGroup(NamedTuple):
     members: 'List[LocalWorker]'
@@ -770,21 +770,15 @@ _local_process_group_being_created = None
 
 
 class BaseWorker:
-    def define_function(self, fn, commands, formals):
-        self.ref_to_tensor[fn.id] = (commands, formals)
+    def define_function(self, fn, code):
+        G = {'torch': torch}
+        exec(code, G)
+        self.ref_to_tensor[fn.id] = G['run']
 
-    def run_function(self, fn, actuals):
-        # note that for performance we should 'compile' this
-        # into a python function rather than interpret the commands
-        # but that requires the compilation of result values unstructuring
-        # (e.g. destructure the tuple to get to the tensors) which
-        # requires some custom tree_flatten/unflatten code
-        commands, formals = self.ref_to_tensor[fn.id]
-        for f, a in zip(formals, actuals):
-            self.ref_to_tensor[f.id] = self.ref_to_tensor[a.id]
-        for cmd in commands:
-            self.send_command(*cmd)
-
+    def run_function(self, fn, args, result_refs):
+        results = self.ref_to_tensor[fn.id](*(self.ref_to_tensor[a.id] for a in args))
+        for r, ref in zip(results, result_refs):
+            self.ref_to_tensor[ref.id] = r
 
 class LocalWorker(BaseWorker):
     """
@@ -991,18 +985,36 @@ def _compile(graph, inputs):
     formals = [f._ref for f in formals]
     _trace = None
 
-    mesh_to_info = {}
+    def name(r):
+        if isinstance(r, RemoteRef):
+            return f'r{r.id}'
+        else:
+            return repr(r)
+
+    lines = []
+    lines.append(f"def run({','.join(name(f) for f in formals)}):")
+    for func, args, kwargs, results in commands:
+        args = tree_map(name, args)
+        kwargs = tree_map(name, kwargs)
+        arg_strings = ', '.join([*args, *('{name}={value}' for name, value in kwargs.items())])
+        lines.append(f"    {', '.join(name(r) for r in results)} = torch.ops.{str(func)}({arg_strings})")
+    lines.append(f"    return {','.join(name(o._ref) for o in outputs_reference)},")
+    lines.append("")
+
+    code = '\n'.join(lines)
+    meshes_defined = set()
+    fn = RemoteRef()
+
     def wrapper(*actuals):
         actual_mesh = actuals[0]._sharding.mesh
-        if actual_mesh not in mesh_to_info:
-            fn = RemoteRef()
+        if actual_mesh not in meshes_defined:
             for worker in actual_mesh.flat_workers:
-                worker.define_function(fn, commands, formals)
-            outputs = [DTensor(o._fake, o._ref, Sharding(actual_mesh, o._sharding.sharding)) for o in outputs_reference]
-            mesh_to_info[actual_mesh] = (fn, outputs)
-        fn, outputs = mesh_to_info[actual_mesh]
+                worker.define_function(fn, code)
+            meshes_defined.add(actual_mesh)
+
+        outputs = [DTensor(o._fake.clone(), RemoteRef(), Sharding(actual_mesh, o._sharding.sharding)) for o in outputs_reference]
         for worker in actual_mesh.flat_workers:
-            worker.run_function(fn, [a._ref for a in actuals])
+            worker.run_function(fn, [a._ref for a in actuals], [o._ref for o in outputs])
         return outputs
     return wrapper
 
