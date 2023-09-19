@@ -1,5 +1,5 @@
 from socket import AF_INET, SOCK_STREAM, socket
-from . import RemoteRef
+from . import RemoteRef, BaseWorker
 import pickle
 import sys
 import torch
@@ -9,7 +9,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten, tree_map
 
 no_response = object()
 
-class LocalWorker:
+class LocalWorker(BaseWorker):
     def __init__(self, host, port, secret):
         self.socket = socket(AF_INET, SOCK_STREAM)
         self.socket.connect((host, int(port)))
@@ -25,10 +25,13 @@ class LocalWorker:
             # print("method:", method, args)
             if method == 'exit':
                 return
-            result = getattr(self, method)(*args)
-            if result is not no_response:
+            elif method == 'request_value':
+                ref, = args
+                result = self.ref_to_tensor[ref.id]
                 self._write_pickle(result)
                 self.ofile.flush()
+            else:
+                getattr(self, method)(*args)
 
     def send_command(self, func, args, kwargs, results):
         def get_tensor(t):
@@ -43,18 +46,13 @@ class LocalWorker:
         real_results = [e for e in flat_results if isinstance(e, torch.Tensor)]
         for real, ref in zip(real_results, results):
             self.ref_to_tensor[ref.id] = real
-        return no_response
 
-    def request_value(self, ref: RemoteRef):
-        return self.ref_to_tensor[ref.id]
 
     def send_value(self, ref: RemoteRef, value: torch.Tensor):
         self.ref_to_tensor[ref.id] = value
-        return no_response
 
     def del_value(self, ref: RemoteRef):
         del self.ref_to_tensor[ref.id]
-        return no_response
 
     def _write_pickle(self, obj):
         b = pickle.dumps(obj)
@@ -69,7 +67,6 @@ class LocalWorker:
     def create_process_group(self, rank, world_size, pg_ref):
         torch.distributed.init_process_group('nccl', init_method='tcp://127.0.0.1:12346', rank=rank, world_size=world_size)
         self.ref_to_tensor[pg_ref.id] = None
-        return no_response
 
     def create_process_subgroup(self, orig_pg, participating_ranks, pg):
         pg = self.ref_to_tensor[orig_pg.id]
@@ -82,7 +79,6 @@ class LocalWorker:
         pg = self.ref_to_tensor[pg_ref.id]
         t = self.ref_to_tensor[ref.id]
         torch.distributed.all_reduce(t, group=pg)
-        return no_response
 
 if __name__ == "__main__":
     _, host, port, secret = sys.argv

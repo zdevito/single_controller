@@ -1,5 +1,5 @@
 import torch
-from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks, Sharding, WorkerMesh
+from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks, Sharding, WorkerMesh, compile
 import unittest
 from torch.testing import assert_close
 import subprocess
@@ -109,6 +109,17 @@ class TestLocal(unittest.TestCase):
             t = t.sum(dim=d)
             ts = t.cpu().to_local().wait()
             assert_close(tl.sum(dim=d), ts)
+
+    def test_compile(self):
+        def foo(a, b):
+            return a*a*a + b
+
+        foo = compile(foo)
+        x = DTensor.to_remote(torch.ones(2, 2) + 1, sharding=self.w)
+        y = DTensor.to_remote(torch.ones(2, 2), sharding=self.w)
+        z = foo(x, y)
+        assert_close(z.to_local().wait(), torch.ones(2, 2)*9)
+
 
 class TestRemote(TestLocal):
     def setUp(self):

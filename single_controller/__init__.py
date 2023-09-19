@@ -275,6 +275,7 @@ def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtens
 
     return mesh, args, kwargs
 
+_trace = None
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     worker = sharding.mesh.flat_workers[0] if sharding else None
@@ -316,8 +317,13 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
 
     ref_args, ref_kwargs = tree_map(get_ref, modified_args), tree_map(get_ref, modified_kwargs)
     ref_results = [r._ref for r in result_dtensors]
-    for worker in mesh.flat_workers:
-        worker.send_command(func, ref_args, ref_kwargs, ref_results)
+    if _trace is not None:
+        m, cmds = _trace
+        assert m is mesh, "multiple compiled mesh NYI"
+        cmds.append((PicklableFunc(func), ref_args, ref_kwargs, ref_results))
+    else:
+        for worker in mesh.flat_workers:
+            worker.send_command(func, ref_args, ref_kwargs, ref_results)
     results = unflatten_result(result_dtensors)
 
     if check_correctness_per_operator:
@@ -423,6 +429,14 @@ class DTensor(BaseTensor):
     def __init__(self, fake, ref, worker):
         pass
 
+
+    def __tensor_flatten__(self):
+        return ['_fake'], (self._ref, self._sharding)
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, meta):
+        return inner_tensors['_fake']
+
     @classmethod
     def to_remote(cls, t: torch.Tensor, sharding: 'Sharding'):
         sharding = Sharding.lift(sharding)
@@ -469,7 +483,7 @@ class DTensor(BaseTensor):
         return self._sharding.manager.schedule(reconstruct_tensor(self))
 
     def __del__(self):
-        if sys is None:
+        if sys is None or _trace is not None:
             return # pytho shutdown
         if self._sharding is None:
             return # an error happening during construction and this wasn't initialized
@@ -742,13 +756,37 @@ class Worker:
         self.commands_to_send.append(b)
         return self._notify_new_commands()
 
+    def define_function(self, fn, commands, formals):
+        self._write_pickle(('define_function', fn, commands, formals))
+
+    def run_function(self, fn, actuals):
+        self._write_pickle(('run_function', fn, actuals))
+
 class LocalProcessGroup(NamedTuple):
     members: 'List[LocalWorker]'
     values: 'List[torch.tensor]'
 
 _local_process_group_being_created = None
 
-class LocalWorker:
+
+class BaseWorker:
+    def define_function(self, fn, commands, formals):
+        self.ref_to_tensor[fn.id] = (commands, formals)
+
+    def run_function(self, fn, actuals):
+        # note that for performance we should 'compile' this
+        # into a python function rather than interpret the commands
+        # but that requires the compilation of result values unstructuring
+        # (e.g. destructure the tuple to get to the tensors) which
+        # requires some custom tree_flatten/unflatten code
+        commands, formals = self.ref_to_tensor[fn.id]
+        for f, a in zip(formals, actuals):
+            self.ref_to_tensor[f.id] = self.ref_to_tensor[a.id]
+        for cmd in commands:
+            self.send_command(*cmd)
+
+
+class LocalWorker(BaseWorker):
     """
     Run in the local process rather than remotely
     """
@@ -818,6 +856,9 @@ class LocalWorker:
 
     def wait(self):
         pass
+
+
+
 
 
 class WorkerList:
@@ -934,3 +975,36 @@ class Sharding:
 
     def from_local(self, t):
         return DTensor.to_remote(t, self)
+
+# super janky "compile" to batch commands
+# TODO: we should turn the commands into a python function that can be run on the remote to avoid the
+# overhead of interpreting it and tree_mapping all values...
+# TODO: we don't support sending different commands to different workers yet
+def _compile(graph, inputs):
+    global _trace
+    mesh = inputs[0]._sharding.mesh
+    commands = []
+    _trace = (mesh, commands)
+    formals = [DTensor(i._fake, RemoteRef(), i._sharding) for i in inputs]
+    outputs_reference = graph(*formals)
+    # delete these DTensor before tracing is over so that their __del__ doesn't send a message.
+    formals = [f._ref for f in formals]
+    _trace = None
+
+    mesh_to_info = {}
+    def wrapper(*actuals):
+        actual_mesh = actuals[0]._sharding.mesh
+        if actual_mesh not in mesh_to_info:
+            fn = RemoteRef()
+            for worker in actual_mesh.flat_workers:
+                worker.define_function(fn, commands, formals)
+            outputs = [DTensor(o._fake, o._ref, Sharding(actual_mesh, o._sharding.sharding)) for o in outputs_reference]
+            mesh_to_info[actual_mesh] = (fn, outputs)
+        fn, outputs = mesh_to_info[actual_mesh]
+        for worker in actual_mesh.flat_workers:
+            worker.run_function(fn, [a._ref for a in actuals])
+        return outputs
+    return wrapper
+
+def compile(*args, **kwargs):
+    return torch.compile(*args, backend=_compile, **kwargs)
