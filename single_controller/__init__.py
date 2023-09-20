@@ -20,8 +20,10 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 import torch._dynamo
 from torch._dynamo.backends.common import aot_autograd
 from functorch.compile import min_cut_rematerialization_partition
+import tempfile
 
 check_correctness_per_operator = False
+_py_compile = compile
 
 if check_correctness_per_operator:
     class RealMode:
@@ -373,6 +375,13 @@ def active_sharding(sharding, force=False):
             yield
         finally:
             tls.sharding = old_sharding
+
+def _current_active_sharding():
+    s = getattr(tls, 'sharding', None)
+    if s == 'inactive':
+        s = None
+    return s
+
 
 class _ActiveSharding(TorchDispatchMode):
     ignore = ['profiler._record_function_exit._RecordFunction']
@@ -773,7 +782,11 @@ _local_process_group_being_created = None
 
 class BaseWorker:
     def define_function(self, fn, code):
-        G = {'torch': torch}
+        with tempfile.NamedTemporaryFile(delete=False, mode='w') as temp:
+            temp.write(code)
+
+        code = _py_compile(code, temp.name, 'exec')
+        G = {'torch': torch, 'device': torch.device}
         exec(code, G)
         self.ref_to_tensor[fn.id] = G['run']
 
@@ -797,12 +810,17 @@ class LocalWorker(BaseWorker):
                 return t
         args = tree_map(get_tensor, args)
         kwargs = tree_map(get_tensor, kwargs)
-        result = func(*args, **kwargs)
+        with active_sharding(None):
+            result = func(*args, **kwargs)
         # list of references picks out the tensors from the result
         flat_results, _ = tree_flatten(result)
         real_results = [e for e in flat_results if isinstance(e, torch.Tensor)]
         for real, ref in zip(real_results, results):
             self.ref_to_tensor[ref.id] = real
+
+    def run_function(self, fn, args, result_refs):
+        with active_sharding(None):
+            return super().run_function(fn, args, result_refs)
 
     def request_value(self, ref: RemoteRef):
         f = self.manager.loop.create_future()
@@ -982,24 +1000,22 @@ class Sharding:
 # TODO: we don't support sending different commands to different workers yet
 def _compile(graph, _):
     sharding_cache = {}
-    the_active_sharding = getattr(tls, 'sharding', None)
-    if the_active_sharding == 'inactive':
-        the_active_sharding = None
 
     def wrapper(inputs):
-        key = tuple(a.sharding._key for a in inputs)
+        key = (*(a.sharding._key for a in inputs), _current_active_sharding())
         if key not in sharding_cache:
             global _trace
             mesh = inputs[0]._sharding.mesh
             commands = []
             _trace = (mesh, commands)
             formals = [DTensor(i._fake, RemoteRef(), i._sharding) for i in inputs]
-            # something is causing the active_sharding resource guard to get lost here,
+
+            # check if something is causing the active_sharding resource guard to get lost here,
             # HACK is to force re-enabled. However a better solution would ensure that the arange and other things
             # just get captured with the sharding as a direct argument or something similar, because in real code
             # we might have captured different constructors with different active shardings...
-            with active_sharding(the_active_sharding, force=True):
-                outputs_reference = graph(*formals)
+            outputs_reference = graph(*formals)
+
             # delete these DTensor before tracing is over so that their __del__ doesn't send a message.
             formals = [f._ref for f in formals]
             _trace = None

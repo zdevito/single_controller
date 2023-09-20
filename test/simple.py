@@ -112,13 +112,14 @@ class TestLocal(unittest.TestCase):
 
     def test_compile(self):
         def foo(a, b):
-            return a*a*a + b
+            return a*a*a + b + torch.arange(4).reshape(2, 2)
 
         foo = compile(foo)
         x = DTensor.to_remote(torch.ones(2, 2) + 1, sharding=self.w)
         y = DTensor.to_remote(torch.ones(2, 2), sharding=self.w)
-        z = foo(x, y)
-        assert_close(z.to_local().wait(), torch.ones(2, 2)*9)
+        with active_sharding(self.w):
+            z = foo(x, y)
+        assert_close(z.to_local().wait(), torch.ones(2, 2)*9 + torch.arange(4).reshape(2, 2))
 
     def test_compile_grad(self):
 
