@@ -120,6 +120,28 @@ class TestLocal(unittest.TestCase):
         z = foo(x, y)
         assert_close(z.to_local().wait(), torch.ones(2, 2)*9)
 
+    def test_compile_grad(self):
+
+        def foo(a, b):
+            return (a*a*a + b).sum(0).sum(0)
+
+        x_l = torch.full((2, 2), 2.0, requires_grad=True)
+        y_l = torch.ones(2, 2, requires_grad=True)
+        z_l = foo(x_l, y_l)
+        z_l.backward()
+
+        foo = compile(foo)
+        sharding = Sharding(WorkerMesh([self.workers[0]]), 'r')
+        x = DTensor.to_remote(torch.full((2, 2), 2.0, requires_grad=True), sharding=sharding)
+        y = DTensor.to_remote(torch.ones(2, 2, requires_grad=True), sharding=sharding)
+        z = foo(x, y)
+        z.backward()
+
+        assert_close(x_l.grad, x.grad.to_local().wait())
+
+
+        #assert_close(z.to_local().wait(), torch.ones(2, 2)*9)
+
 
 class TestRemote(TestLocal):
     def setUp(self):

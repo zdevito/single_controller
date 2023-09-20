@@ -6,6 +6,8 @@ import torch
 from time import sleep
 from torch.utils._pytree import tree_flatten, tree_unflatten, tree_map
 
+# log what is happening
+verbose = False
 
 no_response = object()
 
@@ -22,7 +24,12 @@ class LocalWorker(BaseWorker):
     def run(self):
         while True:
             method, *args = self._read_pickle()
-            # print("method:", method, args)
+            if verbose:
+                if method == "define_function":
+                    fn, body = args
+                    print(f"method: define_function {fn}\n{body}")
+                else:
+                    print("method:", method, args)
             if method == 'exit':
                 return
             elif method == 'request_value':

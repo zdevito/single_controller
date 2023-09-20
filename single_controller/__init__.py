@@ -16,8 +16,10 @@ import traceback
 import atexit
 from functools import cache
 import os
-
 from torch._subclasses.fake_tensor import FakeTensorMode
+import torch._dynamo
+from torch._dynamo.backends.common import aot_autograd
+from functorch.compile import min_cut_rematerialization_partition
 
 check_correctness_per_operator = False
 
@@ -41,7 +43,7 @@ class RemoteRef:
         _next_handle += 1
         self.id = _next_handle
     def __repr__(self):
-        return f"RemoteRef({self.id})"
+        return f"r{self.id}"
 
 
 def is_tensor(x):
@@ -236,8 +238,8 @@ def embedding_backward(args, kwargs, dtensor_input, dtensor_results, sharding_co
 @cache
 def sharding_to_find(func, *args):
     pass
-    #print("FAKE", str(func), func._schema)
-    #print(*args)
+    # print("FAKE", str(func), func._schema)
+    # print(*args)
 
 def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
     key = str(func)
@@ -359,12 +361,12 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
 tls = threading.local()
 
 @contextmanager
-def active_sharding(sharding):
+def active_sharding(sharding, force=False):
     if not hasattr(tls, 'sharding'):
         tls.sharding = 'inactive'
     sharding = None if sharding is None else Sharding.lift(sharding)
     old_sharding = tls.sharding
-    ctx = _ActiveSharding() if old_sharding == 'inactive' else nullcontext()
+    ctx = _ActiveSharding() if old_sharding == 'inactive' or force else nullcontext()
     with ctx:
         tls.sharding = sharding
         try:
@@ -945,6 +947,11 @@ class Sharding:
     def __repr__(self):
         return f"{self.sharding}"
 
+    # for hashing
+    @property
+    def _key(self):
+        return self.mesh, tuple(self.sharding)
+
     @staticmethod
     def lift(obj):
         if isinstance(obj, (LocalWorker,Worker)):
@@ -970,53 +977,60 @@ class Sharding:
     def from_local(self, t):
         return DTensor.to_remote(t, self)
 
+
 # super janky "compile" to batch commands
-# TODO: we should turn the commands into a python function that can be run on the remote to avoid the
-# overhead of interpreting it and tree_mapping all values...
 # TODO: we don't support sending different commands to different workers yet
-def _compile(graph, inputs):
-    global _trace
-    mesh = inputs[0]._sharding.mesh
-    commands = []
-    _trace = (mesh, commands)
-    formals = [DTensor(i._fake, RemoteRef(), i._sharding) for i in inputs]
-    outputs_reference = graph(*formals)
-    # delete these DTensor before tracing is over so that their __del__ doesn't send a message.
-    formals = [f._ref for f in formals]
-    _trace = None
+def _compile(graph, _):
+    sharding_cache = {}
+    the_active_sharding = getattr(tls, 'sharding', None)
+    if the_active_sharding == 'inactive':
+        the_active_sharding = None
 
-    def name(r):
-        if isinstance(r, RemoteRef):
-            return f'r{r.id}'
-        else:
-            return repr(r)
+    def wrapper(inputs):
+        key = tuple(a.sharding._key for a in inputs)
+        if key not in sharding_cache:
+            global _trace
+            mesh = inputs[0]._sharding.mesh
+            commands = []
+            _trace = (mesh, commands)
+            formals = [DTensor(i._fake, RemoteRef(), i._sharding) for i in inputs]
+            # something is causing the active_sharding resource guard to get lost here,
+            # HACK is to force re-enabled. However a better solution would ensure that the arange and other things
+            # just get captured with the sharding as a direct argument or something similar, because in real code
+            # we might have captured different constructors with different active shardings...
+            with active_sharding(the_active_sharding, force=True):
+                outputs_reference = graph(*formals)
+            # delete these DTensor before tracing is over so that their __del__ doesn't send a message.
+            formals = [f._ref for f in formals]
+            _trace = None
 
-    lines = []
-    lines.append(f"def run({','.join(name(f) for f in formals)}):")
-    for func, args, kwargs, results in commands:
-        args = tree_map(name, args)
-        kwargs = tree_map(name, kwargs)
-        arg_strings = ', '.join([*args, *('{name}={value}' for name, value in kwargs.items())])
-        lines.append(f"    {', '.join(name(r) for r in results)} = torch.ops.{str(func)}({arg_strings})")
-    lines.append(f"    return {','.join(name(o._ref) for o in outputs_reference)},")
-    lines.append("")
+            lines = []
+            lines.append(f"def run({','.join(repr(f) for f in formals)}):")
+            for func, args, kwargs, results in commands:
+                arg_list = [*(repr(a) for a in args), *(f'{name}={repr(value)}' for name, value in kwargs.items())]
+                arg_strings = ', '.join(arg_list)
+                lines.append(f"    {', '.join(repr(r) for r in results)} = torch.ops.{str(func)}({arg_strings})")
+            lines.append(f"    return {','.join(repr(o._ref) for o in outputs_reference)},")
+            lines.append("")
 
-    code = '\n'.join(lines)
-    meshes_defined = set()
-    fn = RemoteRef()
-
-    def wrapper(*actuals):
-        actual_mesh = actuals[0]._sharding.mesh
-        if actual_mesh not in meshes_defined:
-            for worker in actual_mesh.flat_workers:
+            code = '\n'.join(lines)
+            fn = RemoteRef()
+            for worker in mesh.flat_workers:
                 worker.define_function(fn, code)
-            meshes_defined.add(actual_mesh)
 
-        outputs = [DTensor(o._fake.clone(), RemoteRef(), Sharding(actual_mesh, o._sharding.sharding)) for o in outputs_reference]
-        for worker in actual_mesh.flat_workers:
-            worker.run_function(fn, [a._ref for a in actuals], [o._ref for o in outputs])
-        return outputs
+            def impl(actuals):
+                outputs = [DTensor(o._fake.clone(), RemoteRef(), o.sharding) for o in outputs_reference]
+                for worker in mesh.flat_workers:
+                    worker.run_function(fn, [a._ref for a in actuals], [o._ref for o in outputs])
+                return outputs
+            sharding_cache[key] = impl
+        return sharding_cache[key](inputs)
+    wrapper._boxed_call = True
     return wrapper
 
+aot_dtensor = aot_autograd(fw_compiler=_compile, partition_fn=min_cut_rematerialization_partition)
+
+
+
 def compile(*args, **kwargs):
-    return torch.compile(*args, backend=_compile, **kwargs)
+    return torch.compile(*args, backend=aot_dtensor, **kwargs)
