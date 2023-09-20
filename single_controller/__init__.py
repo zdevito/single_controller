@@ -21,8 +21,10 @@ import torch._dynamo
 from torch._dynamo.backends.common import aot_autograd
 from functorch.compile import min_cut_rematerialization_partition
 import tempfile
+import warnings
 
 check_correctness_per_operator = False
+simulate_function_calls = False
 _py_compile = compile
 
 if check_correctness_per_operator:
@@ -94,7 +96,7 @@ def same_as_input(args, kwargs, dtensor_input, dtensor_results, sharding_context
     return args, kwargs
 
 
-@prule('aten.ones_like.default')
+@prule(['aten.ones_like.default', 'aten.zeros_like.default'])
 def same_as_input(args, kwargs, dtensor_input, dtensor_results, sharding_context):
     a = dtensor_input[0]
     if any(isinstance(x, int) for x in a.sharding.sharding):
@@ -239,9 +241,8 @@ def embedding_backward(args, kwargs, dtensor_input, dtensor_results, sharding_co
 
 @cache
 def sharding_to_find(func, *args):
-    pass
     # print("FAKE", str(func), func._schema)
-    # print(*args)
+    pass
 
 def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
     key = str(func)
@@ -324,15 +325,19 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     if _trace is not None:
         m, cmds = _trace
         assert m is mesh, "multiple compiled mesh NYI"
-        cmds.append((func, ref_args, ref_kwargs, ref_results))
+        cmds.append((func, ref_args, ref_kwargs, ref_results, result))
     else:
-        for worker in mesh.flat_workers:
-            worker.send_command(func, ref_args, ref_kwargs, ref_results)
+        try:
+            for worker in mesh.flat_workers:
+                worker.send_command(func, ref_args, ref_kwargs, ref_results)
+        except:
+            print(fake_input_tensors)
+            raise
     results = unflatten_result(result_dtensors)
 
     if check_correctness_per_operator:
         key = str(func)
-        # print(key, args, kwargs)
+        print(key, args, kwargs, result_dtensors)
         if "_." in key:
             for i, dtensor in enumerate(dtensors):
                 rem = dtensor.to_local().wait()
@@ -342,7 +347,10 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
                 else:
                     pass #print("nonfinite present...")
                 # don't let small differences accumulate over time when correctness testing
-                dtensor._fake.copy_(rem)
+                try:
+                    dtensor._fake.copy_(rem)
+                except RuntimeError as e:
+                    assert "unsupported operation" in str(e), "Weird tensor shapes cannot be moved around"
         for i, dtensor in enumerate(result_dtensors):
             rem = dtensor.to_local().wait()
             if 'aten._scaled_dot_product_efficient_attention.default' == key and i > 1:
@@ -353,14 +361,20 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
             else:
                 pass #print("nonfinite present...")
             # don't let small differences accumulate over time when correctness testing
-            dtensor._fake.copy_(rem)
-
+            try:
+                dtensor._fake.copy_(rem)
+            except RuntimeError as e:
+                assert "unsupported operation" in str(e), "Weird tensor shapes cannot be moved around"
 
     return results
 
 
 
-tls = threading.local()
+class FakeTLS:
+    pass
+# thread local doesn't quite work right because backwards pass runs in another thread
+# but we don't move the resource guard over there
+tls = FakeTLS() # thread.local()
 
 @contextmanager
 def active_sharding(sharding, force=False):
@@ -382,7 +396,6 @@ def _current_active_sharding():
         s = None
     return s
 
-
 class _ActiveSharding(TorchDispatchMode):
     ignore = ['profiler._record_function_exit._RecordFunction']
     def __torch_dispatch__(self, func, types, args, kwargs):
@@ -391,6 +404,7 @@ class _ActiveSharding(TorchDispatchMode):
         for x in tree_flatten((args, kwargs))[0]:
             if isinstance(x, torch.Tensor):
                 return func(*args, **kwargs)
+        assert tls.sharding != 'inactive', "_ActiveSharding is enabled but set to inactive?"
         return dtensor_dispatch(func, args, kwargs, sharding=tls.sharding)
 
 class PicklableFunc:
@@ -614,7 +628,8 @@ class Manager:
     def create_worker(self, devices=None, local=False):
         secret = str(uuid4())
         if local:
-            assert devices is None, "devices can only be set for real processes"
+            if devices is not None:
+                warnings.warn("devices are ignored for local processes")
             self.workers[secret] = result = LocalWorker(self)
             return result
         env = os.environ.copy()
@@ -1000,8 +1015,11 @@ class Sharding:
 # TODO: we don't support sending different commands to different workers yet
 def _compile(graph, _):
     sharding_cache = {}
-
+    print(graph.code)
     def wrapper(inputs):
+        # ignore the function call and just simulate how the gradients were split
+        if simulate_function_calls:
+            return graph(*inputs)
         key = (*(a.sharding._key for a in inputs), _current_active_sharding())
         if key not in sharding_cache:
             global _trace
@@ -1022,11 +1040,16 @@ def _compile(graph, _):
 
             lines = []
             lines.append(f"def run({','.join(repr(f) for f in formals)}):")
-            for func, args, kwargs, results in commands:
+            for func, args, kwargs, tensor_results, fake_results in commands:
                 arg_list = [*(repr(a) for a in args), *(f'{name}={repr(value)}' for name, value in kwargs.items())]
                 arg_strings = ', '.join(arg_list)
-                lines.append(f"    {', '.join(repr(r) for r in results)} = torch.ops.{str(func)}({arg_strings})")
-            lines.append(f"    return {','.join(repr(o._ref) for o in outputs_reference)},")
+                lhs = [repr(r) for r in tensor_results]
+                if isinstance(fake_results, (list, tuple)):
+                    lhs_it = iter(lhs)
+                    lhs = [next(lhs_it) if isinstance(fr, torch.Tensor) else "_" for fr in fake_results]
+
+                lines.append(f"    {', '.join(lhs)} = torch.ops.{str(func)}({arg_strings})")
+            lines.append(f"    return {','.join(repr(o._ref) for o in outputs_reference if o is not None)},") # outputs can be non-tensor?
             lines.append("")
 
             code = '\n'.join(lines)
@@ -1035,9 +1058,9 @@ def _compile(graph, _):
                 worker.define_function(fn, code)
 
             def impl(actuals):
-                outputs = [DTensor(o._fake.clone(), RemoteRef(), o.sharding) for o in outputs_reference]
+                outputs = [DTensor(o._fake.clone(), RemoteRef(), o.sharding) if o is not None else None for o in outputs_reference]
                 for worker in mesh.flat_workers:
-                    worker.run_function(fn, [a._ref for a in actuals], [o._ref for o in outputs])
+                    worker.run_function(fn, [a._ref for a in actuals], [o._ref for o in outputs if o is not None])
                 return outputs
             sharding_cache[key] = impl
         return sharding_cache[key](inputs)

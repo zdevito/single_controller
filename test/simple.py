@@ -140,8 +140,33 @@ class TestLocal(unittest.TestCase):
 
         assert_close(x_l.grad, x.grad.to_local().wait())
 
+    def test_compile_grad_sharded(self):
 
-        #assert_close(z.to_local().wait(), torch.ones(2, 2)*9)
+        def foo(a, b, t):
+            return torch.nn.functional.cross_entropy(a @ b + a @ b, t, ignore_index=-1, reduction='sum')
+        t_l = torch.zeros(4, dtype=torch.long)
+        x_l = torch.full((4, 3), 1.0, requires_grad=True)
+        y_l = torch.full((3, 2), 2.0, requires_grad=True)
+        z_l = foo(x_l, y_l, t_l)
+
+        z_l.backward()
+
+        w = WorkerMesh(self.workers[0:2])
+        sharding = Sharding(w, 0)
+        rep = Sharding(w, 'r')
+
+        t = torch.zeros(4, dtype=torch.long)
+        x = torch.full((4, 3), 1.0, requires_grad=True)
+        y = torch.full((3, 2), 2.0, requires_grad=True)
+
+        t = DTensor.to_remote(t, sharding=sharding)
+        x = DTensor.to_remote(x, sharding=sharding)
+        y = DTensor.to_remote(y, sharding=rep)
+        foo = compile(foo)
+        z = foo(x, y, t)
+        z.backward()
+        assert_close(x_l.grad, x.grad.to_local().wait())
+
 
 
 class TestRemote(TestLocal):
