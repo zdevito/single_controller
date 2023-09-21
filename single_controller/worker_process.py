@@ -5,9 +5,9 @@ import sys
 import torch
 from time import sleep
 from torch.utils._pytree import tree_flatten, tree_unflatten, tree_map
-
+import os
 # log what is happening
-verbose = False
+verbose = True if os.environ['CUDA_VISIBLE_DEVICES'] == '0' else False
 
 no_response = object()
 
@@ -23,7 +23,9 @@ class LocalWorker(BaseWorker):
 
     def run(self):
         while True:
-            method, *args = self._read_pickle()
+            (method, *args), dels = self._read_pickle()
+            for d in dels:
+                del self.ref_to_tensor[d]
             if verbose:
                 if method == "define_function":
                     fn, body = args

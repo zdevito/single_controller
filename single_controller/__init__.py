@@ -283,6 +283,10 @@ def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtens
 _trace = None
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
+    if func is torch.ops.aten.detach.default:
+        if not args[0].requires_grad:
+            return args[0]
+
     worker = sharding.mesh.flat_workers[0] if sharding else None
 
     def stringify(t):
@@ -717,6 +721,7 @@ class Worker:
         self.new_commands = asyncio.Condition()
         self.commands_to_send = []
         self.pending_futures = []
+        self.to_delete = []
 
     async def connect(self, r, w):
         await asyncio.gather(self.reader(r), self.writer(w))
@@ -747,7 +752,7 @@ class Worker:
         self._write_pickle(('send_value', ref, value))
 
     def del_value(self, ref: RemoteRef):
-        self._write_pickle(('del_value', ref))
+        self.to_delete.append(ref.id)
 
     def create_process_group(self, rank, worldsize, pg_ref):
         self._write_pickle(('create_process_group', rank, worldsize, pg_ref))
@@ -758,9 +763,13 @@ class Worker:
     def all_reduce(self, ref: RemoteRef, pg_ref: RemoteRef):
         self._write_pickle(('all_reduce', ref, pg_ref))
 
-    def _write_pickle(self, obj, future=None):
-        b = self._dumps(obj)
+    def _append_command(self, obj):
+        b = self._dumps((obj, self.to_delete))
+        self.to_delete.clear()
         self.commands_to_send.append(b)
+
+    def _write_pickle(self, obj, future=None):
+        self._append_command(obj)
         self.manager.schedule_void(self._notify_new_commands())
 
     async def _notify_new_commands(self):
@@ -770,7 +779,7 @@ class Worker:
     def request_value(self, request: RemoteRef) -> 'asyncio.Future[torch.Tensor]':
         f = self.manager.loop.create_future()
         self.pending_futures.append(f)
-        self.commands_to_send.append(self._dumps(('request_value', request)))
+        self._append_command(('request_value', request))
         self.manager.schedule_void(self._notify_new_commands())
         return f
 
@@ -778,8 +787,7 @@ class Worker:
         self.proc.wait()
 
     def request_exit(self):
-        b = pickle.dumps(('exit',))
-        self.commands_to_send.append(b)
+        self._append_command(('exit',))
         return self._notify_new_commands()
 
     def define_function(self, fn, code):
