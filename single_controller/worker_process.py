@@ -6,8 +6,11 @@ import torch
 from time import sleep
 from torch.utils._pytree import tree_flatten, tree_unflatten, tree_map
 import os
+from .config import verbose_worker
 # log what is happening
-verbose = True if os.environ['CUDA_VISIBLE_DEVICES'] == '0' else False
+
+if os.environ['CUDA_VISIBLE_DEVICES'] != '0':
+    verbose_worker = False
 
 no_response = object()
 
@@ -26,7 +29,7 @@ class LocalWorker(BaseWorker):
             (method, *args), dels = self._read_pickle()
             for d in dels:
                 del self.ref_to_tensor[d]
-            if verbose:
+            if verbose_worker:
                 if method == "define_function":
                     fn, body = args
                     print(f"method: define_function {fn}\n{body}")

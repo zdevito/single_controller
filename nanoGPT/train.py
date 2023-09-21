@@ -29,10 +29,9 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 from single_controller import DTensor, active_sharding as _active_sharding, Manager, LocalWorker, to_local, WorkerMesh, Sharding, compile as dcompile
+from single_controller.config import nanogpt_use_single_controller, nanogpt_compile
 
-single_controller = True
-
-if single_controller:
+if nanogpt_use_single_controller:
     manager = Manager()
     workers = WorkerMesh([manager.create_worker(devices=[i], local=False) for i in range(2)])
     batch_sharding = Sharding(workers, 0)
@@ -86,7 +85,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+# compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -136,7 +135,7 @@ def get_batch(split):
         ix = torch.randint(len(data) - block_size, (batch_size,))
         x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-        if single_controller:
+        if nanogpt_use_single_controller:
             x = DTensor.to_remote(x, sharding=batch_sharding)
             y = DTensor.to_remote(y, sharding=batch_sharding)
     if False and device_type == 'cuda':
@@ -213,7 +212,7 @@ def dtensorify(module):
     for name, param in module.named_buffers(recurse=False):
         setattr(module, name, DTensor.to_remote(param, sharding=replicated_sharding).to(device))
 
-if single_controller:
+if nanogpt_use_single_controller:
     model.apply(dtensorify)
 else:
     model.to(device)
@@ -233,7 +232,7 @@ checkpoint = None # free up memory
 
 
 # compile the model
-if single_controller and compile:
+if nanogpt_use_single_controller and nanogpt_compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = dcompile(model) # requires PyTorch 2.0
@@ -253,7 +252,7 @@ def estimate_loss():
             X, Y = get_batch(split)
             with ctx:
                 loss = model(X, Y)
-            if single_controller:
+            if nanogpt_use_single_controller:
                 loss = loss.to_sharding_('r')
             losses[k] = loss
         out[split] = losses.mean()
@@ -320,7 +319,7 @@ while True:
                         print(f"saving checkpoint to {out_dir}")
                         torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
             losses = estimate_loss()
-            if single_controller:
+            if nanogpt_use_single_controller:
                 to_local(losses).then(report)
             else:
                 report(losses)
@@ -345,14 +344,14 @@ while True:
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
 
-        if single_controller:
+        if nanogpt_use_single_controller:
             for p in model.parameters():
                 p.grad.to_sharding_('r')
 
         # clip the gradient
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
-            if single_controller:
+            if nanogpt_use_single_controller:
                 for p in model.parameters():
                     assert p.sharding.sharding == ['r']
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -376,7 +375,7 @@ while True:
         def report(loss):
             lossf = loss.item() * gradient_accumulation_steps
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-        if single_controller:
+        if nanogpt_use_single_controller:
             loss.to_sharding_('r').to_local().then(report)
         else:
             report(loss)

@@ -23,8 +23,8 @@ from functorch.compile import min_cut_rematerialization_partition
 import tempfile
 import warnings
 
-check_correctness_per_operator = False
-simulate_function_calls = False
+from .config import check_correctness_per_operator, simulate_function_calls
+
 _py_compile = compile
 
 if check_correctness_per_operator:
@@ -331,12 +331,9 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
         assert m is mesh, "multiple compiled mesh NYI"
         cmds.append((func, ref_args, ref_kwargs, ref_results, result))
     else:
-        try:
-            for worker in mesh.flat_workers:
-                worker.send_command(func, ref_args, ref_kwargs, ref_results)
-        except:
-            print(fake_input_tensors)
-            raise
+        for worker in mesh.flat_workers:
+            worker.send_command(func, ref_args, ref_kwargs, ref_results)
+
     results = unflatten_result(result_dtensors)
 
     if check_correctness_per_operator:
@@ -1023,7 +1020,6 @@ class Sharding:
 # TODO: we don't support sending different commands to different workers yet
 def _compile(graph, _):
     sharding_cache = {}
-    print(graph.code)
     def wrapper(inputs):
         # ignore the function call and just simulate how the gradients were split
         if simulate_function_calls:
