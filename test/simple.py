@@ -1,5 +1,5 @@
 import torch
-from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks, Sharding, compile, WorkerMesh
+from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks, Sharding, compile, WorkerMesh, psum_
 import unittest
 from torch.testing import assert_close
 import subprocess
@@ -179,6 +179,20 @@ class TestLocal(unittest.TestCase):
         t.to_sharding_(replicated)
         ts = t.cpu().to_local().wait()
         assert_close(tl.sum(dim=0), ts)
+
+    def test_implicit_batch(self):
+        mesh = self.workers[0:2]
+        sharded = mesh.Sharding('b')
+        replicated = mesh.Sharding('r')
+        tl = torch.arange(4*6).reshape(4, 6)
+        rl = torch.arange(2*6).reshape(2, 6)
+        t = sharded.DTensor(tl)
+        r = replicated.DTensor(rl)
+        assert t.size(0) == 2
+        assert_close((t + r).to_local().wait(), tl + torch.cat([rl, rl]))
+        tc = t.cuda()
+        psum_(tc)
+        assert_close(tc.cpu().to_local().wait(), tl[0:2] + tl[2:4])
 
 
 

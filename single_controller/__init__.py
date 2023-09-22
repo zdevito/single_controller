@@ -241,16 +241,36 @@ def embedding_backward(args, kwargs, dtensor_input, dtensor_results, sharding_co
 
 @cache
 def sharding_to_find(func, *args):
-    # print("FAKE", str(func), func._schema)
+    print("Using FAKE sharding rule, things may break: ", str(func), func._schema)
     pass
 
 def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
-    key = str(func)
     mesh = dtensor_input[0]._sharding.mesh if dtensor_input else sharding_context.mesh
+
+    any_partial_or_explicit_shard = False
     for d in dtensor_input:
         if d._sharding.mesh is not mesh:
             raise NotImplementedError("operation on tensors distributed on different device meshes")
+        for ann in d.sharding.sharding:
+            if ann == '+' or isinstance(ann, int):
+                any_partial_or_explicit_shard = True
 
+    if not any_partial_or_explicit_shard:
+        # easy case, only implicit batching or replicated, so the rule is that things become
+        # implicitly batched if one input is implicitly batch in that mesh dimension
+        # otherwise they stay replicated
+        if sharding_context is not None:
+            sharding = sharding_context
+        else:
+            new_annotations = ['b' if any(e == 'b' for e in cross_input_annotations) else 'r' for cross_input_annotations in zip(*(d.sharding.sharding for d in dtensor_input))]
+            sharding = Sharding(mesh, new_annotations)
+        for r in dtensor_results:
+            r._sharding = sharding
+        return mesh, args, kwargs
+
+    # fake cases
+    key = str(func)
+    sharding_to_find(func, str(args), str(kwargs), str(dtensor_results))
     if key in prules:
         args, kwargs = prules[key](args, kwargs, dtensor_input=dtensor_input, dtensor_results=dtensor_results, sharding_context=sharding_context)
         return mesh, args, kwargs
@@ -469,20 +489,33 @@ class DTensor(BaseTensor):
         f = fake_mode.from_tensor(t)
         r = RemoteRef()
 
-        result = DTensor(f, r, sharding)
         shape = sharding.mesh.shape
+
+        batch_dim = 0
+
+        def split_dim(i, to_split):
+            nonlocal t
+            sizes = t.size()
+            split_adjusted = to_split + i
+            d = sizes[split_adjusted]
+            assert d % shape.size(i) == 0, "NOT EVENLY SPLIT"
+            chunk_size = d // shape.size(i)
+            t = t.reshape(*sizes[:split_adjusted], shape.size(i), chunk_size, *sizes[split_adjusted+1:])
+            t = t.movedim(split_adjusted, i)
+            return chunk_size
 
         for i, ann in enumerate(sharding.sharding):
             if ann == "r":
                 t = t.expand(shape.size(i), *t.size())
                 t = t.movedim(0, i)
             elif isinstance(ann, int):
-                sizes = t.size()
-                ann_adjusted = ann + i
-                d = sizes[ann_adjusted]
-                assert d % shape.size(i) == 0, "NOT EVENLY SPLIT"
-                t = t.reshape(*sizes[:ann_adjusted], shape.size(i), d // shape.size(i), *sizes[ann_adjusted+1:])
-                t = t.movedim(ann_adjusted, i)
+                split_dim(i, ann)
+            elif ann == "b":
+                chunk_size = split_dim(i, batch_dim)
+                sizes = f.size()
+                index = tuple(slice(0, chunk_size) if i == batch_dim else slice(None) for i in range(f.dim()))
+                f = f[index]
+                batch_dim += 1
             else:
                 raise NotImplementedError(f"Annotation: {ann}")
 
@@ -496,7 +529,7 @@ class DTensor(BaseTensor):
                 worker = sharding.mesh._workers.workers[idx]
                 worker.send_value(r, local)
 
-        return result
+        return DTensor(f, r, sharding)
 
     def __repr__(self):
        return f"DTensor(sharding={self.sharding}, shape={list(self.shape)})"
@@ -526,6 +559,26 @@ class DTensor(BaseTensor):
         new_sharding.apply_inplace(self)
         return self
 
+def psum_(tensors, meshdim=0):
+    if isinstance(tensors, torch.Tensor):
+        tensors = [tensors]
+    if not tensors:
+        return
+    mesh = tensors[0]._sharding.mesh
+    for i, d in enumerate(tensors):
+        if d._sharding.mesh is not mesh:
+            raise NotImplementedError("operation on tensors distributed on different device meshes")
+        annotations = d.sharding.sharding.copy()
+        if annotations[meshdim] != 'b':
+            raise ValueError("tensor {i} not batched along {meshdim}")
+        annotations[meshdim] = 'r'
+        d._sharding = Sharding(mesh, annotations)
+
+    pg = mesh._process_group(meshdim)
+    refs = [t._ref.id for t in tensors]
+    for worker in mesh.flat_workers:
+        worker.all_reduce_coalesced(refs, pg)
+
 def reconstruct_tensor(dtensor):
     annotations, mesh = dtensor._sharding.sharding, dtensor._sharding.mesh
     dims = []
@@ -533,15 +586,19 @@ def reconstruct_tensor(dtensor):
     for a in annotations:
         if a == 'r':
             mesh_indexing.append(0)
-        elif isinstance(a, int) or a == '+':
+        elif isinstance(a, int) or a == '+' or a == 'b':
             mesh_indexing.append(slice(None))
             dims.append(a)
         else:
             raise NotImplementedError(f"Annotation {a}")
+
+
     mesh = WorkerMesh(mesh._workers, mesh.shape[tuple(mesh_indexing)])
     futures = [worker.request_value(dtensor._ref) for worker in mesh.flat_workers]
+    first_real_dim = len(dims)
 
     async def reconstruct():
+        nonlocal first_real_dim
         local_values = [await f for f in futures]
         local_value = torch.stack(local_values)
         reshaped = (*mesh.shape.size(), *local_value.size()[1:])
@@ -550,10 +607,15 @@ def reconstruct_tensor(dtensor):
             if d == '+': # efficiency wise it is better to do all_reduce first, then transfer from 1
                          # but this is useful for debugging
                 local_value = local_value.sum(dim=0)
+            elif d == 'b':
+                local_value = local_value.movedim(0, first_real_dim - 1)
+                local_value = local_value.flatten(first_real_dim - 1, first_real_dim)
             else:
-                adjusted_dim = d + (len(dims) - i - 1)
-                local_value = local_value.movedim(0, adjusted_dim)
-                local_value = local_value.flatten(adjusted_dim, adjusted_dim + 1)
+                adjusted_dim = first_real_dim + d
+                local_value = local_value.movedim(0, adjusted_dim - 1)
+                local_value = local_value.flatten(adjusted_dim - 1, adjusted_dim)
+            first_real_dim -= 1
+
         return local_value
     return reconstruct()
 
@@ -960,6 +1022,10 @@ class Sharding:
                               #   of the device mesh
                  Literal["r", # replicated - a copy of the data is stored
                               #   across this dimension of the device mesh
+                         "b", # implicitly batched - each worker has a different copy
+                              # of data along this dimension of the device mesh
+                              # but it acts an an implicitly batched dimension for the
+                              # purpose of operactors acting on the tensor
                          "+"  # partial sum - the value of the tensor is
                               #   the sum of the tensors stored along
                               #   this dimension of the device mesh
