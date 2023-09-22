@@ -566,7 +566,7 @@ def reconstruct_tensor(dtensor):
             dims.append(a)
         else:
             raise NotImplementedError(f"Annotation {a}")
-    mesh = mesh[tuple(mesh_indexing)]
+    mesh = WorkerMesh(mesh._workers, mesh.shape[tuple(mesh_indexing)])
     futures = [worker.request_value(dtensor._ref) for worker in mesh.flat_workers]
 
     async def reconstruct():
@@ -652,6 +652,18 @@ class Manager:
         self.workers[secret] = result = Worker(self)
         result.proc = Popen([sys.executable, '-m', 'single_controller.worker_process', self.host, str(self.port), secret], env=env)
         return result
+
+    def Worker(self, devices=None, local=False):
+        return self.create_worker(devices, local)
+
+    def create_workers(self, shape, local=False) -> 'WorkerMesh':
+        N = 1
+        if isinstance(shape, int):
+            shape = (shape,)
+        for s in shape:
+            N *= s
+        device_count = torch.cuda.device_count()
+        return WorkerMesh([self.Worker(devices=[i % device_count]) for i in range(N)]).reshape(*shape)
 
     def schedule_void(self, co):
         async def wrap():
@@ -931,7 +943,10 @@ class WorkerMesh:
         return WorkerMesh(self._workers, self.shape.reshape(*dims))
 
     def __getitem__(self, elem):
-        return WorkerMesh(self._workers, self.shape[elem])
+        wm = WorkerMesh(self._workers, self.shape[elem])
+        if wm.shape.dim() == 0:
+            wm = wm.Sharding()
+        return wm
 
     def select(self, dim, index):
         return WorkerMesh(self._workers, self.shape[index])
@@ -985,6 +1000,7 @@ class Sharding:
         self.sharding = sharding
         if isinstance(self.sharding, (str, int)):
             self.sharding = [self.sharding]
+        assert len(self.sharding) == self.mesh.shape.dim(), "Mismatched sharding annotations to device mesh"
 
     def __repr__(self):
         return f"{self.sharding}"

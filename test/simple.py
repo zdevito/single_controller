@@ -10,7 +10,7 @@ class TestLocal(unittest.TestCase):
     def setUp(self):
         global local_workers
         if local_workers is None:
-            local_workers = [manager.create_worker(local=True) for _ in range(4)]
+            local_workers = manager.create_workers(4, local=True).flat_workers
         self.w = local_workers[0]
         self.workers = local_workers
 
@@ -186,12 +186,12 @@ class TestRemote(TestLocal):
     def setUp(self):
         global workers
         if workers is None:
-            workers = [manager.create_worker(devices=i % 2, local=False) for i in range(4)]
+            workers = manager.create_workers(4).flat_workers
         self.w = workers[0]
         self.workers = workers
 
     def test_devices(self):
-        mesh = WorkerMesh([manager.create_worker(0), manager.create_worker(1)])
+        mesh = manager.create_workers(2)
         sharding = mesh.Sharding(0)
         r = DTensor.to_remote(torch.rand(4, 2), sharding)
         r = r.cuda()
