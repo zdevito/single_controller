@@ -33,9 +33,9 @@ from single_controller.config import nanogpt_use_single_controller, nanogpt_comp
 
 if nanogpt_use_single_controller:
     manager = Manager()
-    workers = WorkerMesh([manager.create_worker(devices=[i], local=True) for i in range(2)])
-    batch_sharding = Sharding(workers, 0)
-    replicated_sharding = Sharding(workers, 'r')
+    workers = manager.create_workers(2, local=False)
+    batch_sharding = workers.Sharding(0)
+    replicated_sharding = workers.Sharding('r')
     active_sharding = _active_sharding
 else:
     replicated_sharding = None

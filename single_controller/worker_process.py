@@ -10,7 +10,7 @@ from .config import verbose_worker
 # log what is happening
 
 if os.environ['CUDA_VISIBLE_DEVICES'] != '0':
-    verbose_worker = False
+   verbose_worker = False
 
 no_response = object()
 
@@ -77,12 +77,12 @@ class RemoteWorker(BaseWorker):
         return pickle.loads(self.ifile.read(sz))
 
     def create_process_group(self, rank, world_size, pg_ref):
-        torch.distributed.init_process_group('nccl', init_method='tcp://127.0.0.1:12346', rank=rank, world_size=world_size)
+        torch.distributed.init_process_group('nccl', init_method='tcp://127.0.0.1:12350', rank=rank, world_size=world_size)
         self.ref_to_tensor[pg_ref.id] = None
 
     def create_process_subgroup(self, orig_pg, participating_ranks, pg):
-        pg = self.ref_to_tensor[orig_pg.id]
-        assert pg is None, "subgroup must be created from default group..."
+        pg_obj = self.ref_to_tensor[orig_pg.id]
+        assert pg_obj is None, "subgroup must be created from default group..."
         r = torch.distributed.new_group(ranks=participating_ranks, backend='nccl')
         if pg is not None:
             self.ref_to_tensor[pg.id] = r

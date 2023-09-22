@@ -663,7 +663,7 @@ class Manager:
         for s in shape:
             N *= s
         device_count = torch.cuda.device_count()
-        return WorkerMesh([self.Worker(devices=[i % device_count]) for i in range(N)]).reshape(*shape)
+        return WorkerMesh([self.Worker(devices=[i % device_count], local=local) for i in range(N)]).reshape(*shape)
 
     def schedule_void(self, co):
         async def wrap():
@@ -882,13 +882,7 @@ class LocalWorker(BaseWorker):
     def create_process_subgroup(self, orig_pg, participating_ranks, pg):
         if pg is None:
             return
-        global _local_process_group_being_created
-        if _local_process_group_being_created is None:
-            _local_process_group_being_created = LocalProcessGroup([], [])
-        self.ref_to_tensor[pg_ref.id] = _local_process_group_being_created
-        _local_process_group_being_created.members.append(self)
-        if len(_local_process_group_being_created.members) == len(participating_ranks):
-            _local_process_group_being_created = None
+        return self.create_process_group(None, len(participating_ranks), pg)
 
     def all_reduce_coalesced(self, refs: List[int], pg_ref: RemoteRef):
         pg = self.ref_to_tensor[pg_ref.id]
@@ -955,10 +949,19 @@ class WorkerMesh:
         return f'Mesh<{"x".join(str(s) for s in self.shape.size())}>'
 
     def _process_group(self, dim: int):
+        def create_subgroup(pg, ranks):
+            for i, w in enumerate(self._workers.workers):
+                w.create_process_subgroup(self._workers.process_group, ranks, pg if i in ranks else None)
         if dim not in self.dim_to_pg:
             if self.shape.dim() == 1:
                 assert dim == 0
-                self.dim_to_pg[dim] = self._workers.process_group
+                if len(self._workers.workers) == len(self.flat_workers):
+                    self.dim_to_pg[dim] = self._workers.process_group
+                else:
+                    pg = RemoteRef()
+                    ranks = [s.item() for s in self.shape]
+                    create_subgroup(pg, ranks)
+                    self.dim_to_pg[dim] =  pg
             else:
                 pg = self.dim_to_pg[dim] = RemoteRef()
                 flat_shape = self.shape.movedim(dim, -1).flatten(0, -2)

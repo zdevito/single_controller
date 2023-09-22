@@ -1,5 +1,5 @@
 import torch
-from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks, Sharding, WorkerMesh, compile
+from single_controller import DTensor, active_sharding, Manager, LocalWorker, to_local, _debug_wait_pending_callbacks, Sharding, compile, WorkerMesh
 import unittest
 from torch.testing import assert_close
 import subprocess
@@ -10,7 +10,7 @@ class TestLocal(unittest.TestCase):
     def setUp(self):
         global local_workers
         if local_workers is None:
-            local_workers = manager.create_workers(4, local=True).flat_workers
+            local_workers = manager.create_workers(4, local=True)
         self.w = local_workers[0]
         self.workers = local_workers
 
@@ -53,7 +53,7 @@ class TestLocal(unittest.TestCase):
         self.assertEqual(x.dim(), 2)
 
     def test_two_workers(self):
-        mesh = WorkerMesh(self.workers[0:2])
+        mesh = self.workers[0:2]
         sharding = mesh.Sharding(0)
         r = DTensor.to_remote(torch.arange(12).reshape(4, 3), sharding)
         r = (r + r).sum(dim=1)
@@ -66,7 +66,7 @@ class TestLocal(unittest.TestCase):
         self.assertTrue(torch.allclose(r.to_local().wait(), (torch.arange(12).reshape(3, 4)*2).sum(dim=0, keepdim=True)))
 
     def test_four_workers(self):
-        mesh = WorkerMesh(self.workers[0:4]).reshape(2, 2)
+        mesh = self.workers[0:4].reshape(2, 2)
         sharding = mesh.Sharding(2, 0)
         inp = torch.arange(4*5*4).reshape(4, 5, 4)
         r = DTensor.to_remote(inp, sharding)
@@ -75,7 +75,7 @@ class TestLocal(unittest.TestCase):
         self.assertTrue(torch.allclose(inp + inp, (r + r).to_local().wait()))
 
     def test_replicated(self):
-        mesh = WorkerMesh(self.workers[0:2])
+        mesh = self.workers[0:2]
         rep = mesh.Sharding('r')
         split = mesh.Sharding(0)
         W = torch.rand(3, 4)
@@ -88,7 +88,7 @@ class TestLocal(unittest.TestCase):
         assert_close(Wr.to_local().wait(), W)
 
     def test_shardreplicate(self):
-        mesh = WorkerMesh(self.workers[0:4]).reshape(2, 2)
+        mesh = self.workers[0:4].reshape(2, 2)
         rep = mesh.Sharding('r', 'r')
         split = mesh.Sharding(0, 'r')
         W = torch.rand(3, 4)
@@ -101,7 +101,7 @@ class TestLocal(unittest.TestCase):
         assert_close(Wr.to_local().wait(), W)
 
     def test_partial(self):
-        mesh = WorkerMesh(self.workers[0:2])
+        mesh = self.workers[0:2]
         for d in range(2):
             sharded = mesh.Sharding(d)
             tl = torch.arange(4*6).reshape(4, 6)
@@ -132,7 +132,7 @@ class TestLocal(unittest.TestCase):
         z_l.backward()
 
         foo = compile(foo)
-        sharding = Sharding(WorkerMesh([self.workers[0]]), 'r')
+        sharding = WorkerMesh([self.workers.flat_workers[0]]).Sharding('r')
         x = DTensor.to_remote(torch.full((2, 2), 2.0, requires_grad=True), sharding=sharding)
         y = DTensor.to_remote(torch.ones(2, 2, requires_grad=True), sharding=sharding)
         z = foo(x, y)
@@ -151,7 +151,7 @@ class TestLocal(unittest.TestCase):
 
         z_l.backward()
 
-        w = WorkerMesh(self.workers[0:2])
+        w = self.workers[0:2]
         sharding = w.Sharding(0)
         rep = w.Sharding('r')
 
@@ -169,7 +169,7 @@ class TestLocal(unittest.TestCase):
 
 
     def test_reduce(self):
-        mesh = WorkerMesh(self.workers[0:2])
+        mesh = self.workers[0:2]
         sharded = mesh.Sharding(0)
         replicated = mesh.Sharding('r')
 
@@ -186,7 +186,7 @@ class TestRemote(TestLocal):
     def setUp(self):
         global workers
         if workers is None:
-            workers = manager.create_workers(4).flat_workers
+            workers = manager.create_workers(4)
         self.w = workers[0]
         self.workers = workers
 
