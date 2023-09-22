@@ -185,7 +185,7 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             flat_logits = logits.view(-1, logits.size(-1))
-            loss = F.cross_entropy(flat_logits, targets.view(-1), ignore_index=-1, reduction='sum') / flat_logits.size(0)
+            loss = F.cross_entropy(flat_logits, targets.view(-1), ignore_index=-1, reduction='mean')
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

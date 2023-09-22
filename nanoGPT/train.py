@@ -28,13 +28,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-from single_controller import DTensor, active_sharding as _active_sharding, Manager, LocalWorker, to_local, WorkerMesh, Sharding, compile as dcompile
+from single_controller import DTensor, active_sharding as _active_sharding, Manager, LocalWorker, to_local, WorkerMesh, Sharding, compile as dcompile, psum_
 from single_controller.config import nanogpt_use_single_controller, nanogpt_compile
 
 if nanogpt_use_single_controller:
+    num_workers = 2
     manager = Manager()
-    workers = manager.create_workers(2, local=False)
-    batch_sharding = workers.Sharding(0)
+    workers = manager.create_workers(num_workers, local=False)
+    batch_sharding = workers.Sharding('b')
     replicated_sharding = workers.Sharding('r')
     active_sharding = _active_sharding
 else:
@@ -345,7 +346,7 @@ while True:
             scaler.scale(loss).backward()
 
         if nanogpt_use_single_controller:
-            replicated_sharding.apply_inplace(*(p.grad for p in model.parameters()))
+            psum_([p.grad for p in model.parameters()])
 
         # clip the gradient
         if grad_clip != 0.0:
@@ -373,9 +374,12 @@ while True:
 
         def report(loss):
             lossf = loss.item() * gradient_accumulation_steps
+            if nanogpt_use_single_controller:
+                lossf /= num_workers
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         if nanogpt_use_single_controller:
-            loss.to_sharding_('r').to_local().then(report)
+            psum_(loss)
+            loss.to_local().then(report)
         else:
             report(loss)
 
