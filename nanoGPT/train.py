@@ -345,8 +345,7 @@ while True:
             scaler.scale(loss).backward()
 
         if nanogpt_use_single_controller:
-            for p in model.parameters():
-                p.grad.to_sharding_('r')
+            replicated_sharding.apply_inplace(*(p.grad for p in model.parameters()))
 
         # clip the gradient
         if grad_clip != 0.0:

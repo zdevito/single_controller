@@ -523,36 +523,8 @@ class DTensor(BaseTensor):
     def to_sharding_(self, new_sharding):
         if not isinstance(new_sharding, Sharding):
             new_sharding = Sharding(self.sharding.mesh, new_sharding)
-        if self.sharding.mesh is not new_sharding.mesh:
-            raise NotImplementedError(f"Cross mesh transfer {self.sharding.mesh} is not {new_sharding.mesh}")
-        for i, (olda, newa) in enumerate(zip(self.sharding.sharding, new_sharding.sharding)):
-            if olda == newa:
-                continue
-            if newa == '+':
-                raise ValueError(f"unexpected introduction of partial sum {self.sharding.sharding} -> {new_sharding.sharding}")
-            if olda == '+' and newa == 'r':
-                # all reduce
-                pg = self.sharding.mesh._process_group(i)
-                for worker in self.sharding.mesh.flat_workers:
-                    worker.all_reduce_coalesced([self._ref.id], pg)
-            elif olda == '+' and isinstance(newa, int):
-                # reduce scatter
-                raise NotImplementedError("Reduce scatter")
-            elif isinstance(olda, int) and newa == 'r':
-                raise NotImplementedError("all gather")
-            elif olda == "r" and isinstance(newa, int):
-                raise NotImplementedError("drop some value")
-
-        self._sharding = new_sharding
-        if check_correctness_per_operator:
-            rem = self.to_local().wait()
-            torch.testing.assert_close(self._fake, rem, atol=1e-03, rtol=1e-03)
-            # don't let small differences accumulate over time when correctness testing
-            self._fake.copy_(rem)
-
+        new_sharding.apply_inplace(self)
         return self
-
-
 
 def reconstruct_tensor(dtensor):
     annotations, mesh = dtensor._sharding.sharding, dtensor._sharding.mesh
@@ -1037,6 +1009,44 @@ class Sharding:
 
     def DTensor(self, t):
         return DTensor.to_remote(t, self)
+
+    def apply_inplace(self, *tensors):
+        reduce_pg_to_args = {}
+        for t in tensors:
+            if t.sharding.mesh is not self.mesh:
+                raise NotImplementedError(f"Cross mesh transfer {t.sharding.mesh} is not {self.mesh}")
+            for i, (olda, newa) in enumerate(zip(t.sharding.sharding, self.sharding)):
+                if olda == newa:
+                    continue
+                if newa == '+':
+                    raise ValueError(f"unexpected introduction of partial sum {t.sharding.sharding} -> {self.sharding}")
+                if olda == '+' and newa == 'r':
+                    # all reduce
+                    pg = self.mesh._process_group(i)
+                    if pg not in reduce_pg_to_args:
+                        reduce_pg_to_args[pg] = []
+                    reduce_pg_to_args[pg].append(t._ref.id)
+                elif olda == '+' and isinstance(newa, int):
+                    # reduce scatter
+                    raise NotImplementedError("Reduce scatter")
+                elif isinstance(olda, int) and newa == 'r':
+                    raise NotImplementedError("all gather")
+                elif olda == "r" and isinstance(newa, int):
+                    raise NotImplementedError("drop some value")
+            t._sharding = self
+
+        for pg, args in reduce_pg_to_args.items():
+            for worker in self.mesh.flat_workers:
+                worker.all_reduce_coalesced(args, pg)
+
+        if check_correctness_per_operator:
+            for t in tensors:
+                rem = t.to_local().wait()
+                torch.testing.assert_close(t._fake, rem, atol=1e-03, rtol=1e-03)
+                # don't let small differences accumulate over time when correctness testing
+                t._fake.copy_(rem)
+
+
 
 
 # super janky "compile" to batch commands
