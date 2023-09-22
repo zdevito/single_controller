@@ -14,7 +14,7 @@ if os.environ['CUDA_VISIBLE_DEVICES'] != '0':
 
 no_response = object()
 
-class LocalWorker(BaseWorker):
+class RemoteWorker(BaseWorker):
     def __init__(self, host, port, secret):
         self.socket = socket(AF_INET, SOCK_STREAM)
         self.socket.connect((host, int(port)))
@@ -87,12 +87,12 @@ class LocalWorker(BaseWorker):
         if pg is not None:
             self.ref_to_tensor[pg.id] = r
 
-    def all_reduce(self, ref: RemoteRef, pg_ref: RemoteRef):
+    def all_reduce_coalesced(self, refs: 'List[int]', pg_ref: RemoteRef):
         pg = self.ref_to_tensor[pg_ref.id]
-        t = self.ref_to_tensor[ref.id]
-        torch.distributed.all_reduce(t, group=pg)
+        ts = [self.ref_to_tensor[r] for r in refs]
+        torch.distributed.all_reduce_coalesced(ts, group=pg)
 
 if __name__ == "__main__":
     _, host, port, secret = sys.argv
-    w = LocalWorker(host, port, secret)
+    w = RemoteWorker(host, port, secret)
     w.run()

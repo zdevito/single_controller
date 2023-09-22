@@ -534,7 +534,7 @@ class DTensor(BaseTensor):
                 # all reduce
                 pg = self.sharding.mesh._process_group(i)
                 for worker in self.sharding.mesh.flat_workers:
-                    worker.all_reduce(self._ref, pg)
+                    worker.all_reduce_coalesced([self._ref.id], pg)
             elif olda == '+' and isinstance(newa, int):
                 # reduce scatter
                 raise NotImplementedError("Reduce scatter")
@@ -757,8 +757,8 @@ class Worker:
     def create_process_subgroup(self, orig_pg, participating_ranks, pg):
         self._write_pickle(('create_process_subgroup', orig_pg, participating_ranks, pg))
 
-    def all_reduce(self, ref: RemoteRef, pg_ref: RemoteRef):
-        self._write_pickle(('all_reduce', ref, pg_ref))
+    def all_reduce_coalesced(self, ref: List[int], pg_ref: RemoteRef):
+        self._write_pickle(('all_reduce_coalesced', ref, pg_ref))
 
     def _append_command(self, obj):
         b = self._dumps((obj, self.to_delete))
@@ -878,14 +878,15 @@ class LocalWorker(BaseWorker):
         if len(_local_process_group_being_created.members) == len(participating_ranks):
             _local_process_group_being_created = None
 
-    def all_reduce(self, ref: RemoteRef, pg_ref: RemoteRef):
+    def all_reduce_coalesced(self, refs: List[int], pg_ref: RemoteRef):
         pg = self.ref_to_tensor[pg_ref.id]
-        t = self.ref_to_tensor[ref.id]
+        t = [self.ref_to_tensor[r] for r in refs]
         pg.values.append(t)
         if len(pg.values) == len(pg.members):
-            r = torch.stack(pg.values).sum(dim=0)
-            for m in pg.members:
-                m.ref_to_tensor[ref.id] = r.clone()
+            for i, ref in enumerate(refs):
+                stacked = torch.stack([value[i] for value in pg.values]).sum(dim=0)
+                for m in pg.members:
+                    m.ref_to_tensor[ref] = stacked.clone()
             pg.values.clear()
 
     def wait(self):
@@ -952,6 +953,9 @@ class WorkerMesh:
                         w.create_process_subgroup(self._workers.process_group, ranks, pg if i in ranks else None)
         return self.dim_to_pg[dim]
 
+    def Sharding(self, *annotations):
+        return Sharding(self, list(annotations))
+
 class Sharding:
     """
     A description of how a single tensor is sharded across devices.
@@ -1012,7 +1016,7 @@ class Sharding:
     def change(self, mesh=None, sharding=None):
         return Sharding(mesh=mesh if mesh else self.mesh, sharding=sharding if sharding else self.sharding)
 
-    def from_local(self, t):
+    def DTensor(self, t):
         return DTensor.to_remote(t, self)
 
 
