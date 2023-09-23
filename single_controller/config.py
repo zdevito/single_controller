@@ -10,7 +10,7 @@ check_correctness_per_operator = False
 simulate_function_calls = False
 
 # worker will print what commands it is running before running them
-verbose_worker =  False
+verbose_worker = False
 
 
 if check_correctness_per_operator:

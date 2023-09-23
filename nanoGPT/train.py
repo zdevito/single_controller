@@ -285,6 +285,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
 while True:
     with active_sharding(replicated_sharding):
         # determine and set the learning rate for this iteration
@@ -351,9 +352,6 @@ while True:
         # clip the gradient
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
-            if nanogpt_use_single_controller:
-                for p in model.parameters():
-                    assert p.sharding.sharding == ['r']
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         # step the optimizer and scaler if training in fp16
         scaler.step(optimizer)

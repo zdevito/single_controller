@@ -46,6 +46,7 @@ class RemoteRef:
         global _next_handle
         _next_handle += 1
         self.id = _next_handle
+
     def __repr__(self):
         return f"r{self.id}"
 
@@ -962,10 +963,7 @@ class WorkerMesh:
         self._workers = workers
         self.shape = torch.arange(len(workers.workers)) if shape is None else shape
         self.dim_to_pg = {}
-
-    @property
-    def flat_workers(self):
-        return [self._workers.workers[idx.item()] for idx in self.shape.flatten()]
+        self.flat_workers =  [self._workers.workers[idx.item()] for idx in self.shape.flatten()]
 
     def reshape(self, *dims):
         return WorkerMesh(self._workers, self.shape.reshape(*dims))
@@ -1117,7 +1115,7 @@ class Sharding:
 
 # super janky "compile" to batch commands
 # TODO: we don't support sending different commands to different workers yet
-def _compile(graph, _):
+def _compile_stage2(graph, _, gmesh=None):
     sharding_cache = {}
     def wrapper(inputs):
         # ignore the function call and just simulate how the gradients were split
@@ -1126,7 +1124,10 @@ def _compile(graph, _):
         key = (*(a.sharding._key for a in inputs), _current_active_sharding())
         if key not in sharding_cache:
             global _trace
-            mesh = inputs[0]._sharding.mesh
+            if gmesh is None:
+                mesh = inputs[0]._sharding.mesh
+            else:
+                mesh = gmesh
             commands = []
             _trace = (mesh, commands)
             formals = [DTensor(i._fake, RemoteRef(), i._sharding) for i in inputs]
@@ -1136,23 +1137,39 @@ def _compile(graph, _):
             # just get captured with the sharding as a direct argument or something similar, because in real code
             # we might have captured different constructors with different active shardings...
             outputs_reference = graph(*formals)
-
-            # delete these DTensor before tracing is over so that their __del__ doesn't send a message.
+            if outputs_reference is None:
+                outputs_reference = []
             formals = [f._ref for f in formals]
+            # delete these DTensor before tracing is over so that their __del__ doesn't send a message.
             _trace = None
+
+            extra_actuals = []
+
+            defined = set(formals)
+            for func, args, kwargs, tensor_results, fake_results in commands:
+                flat_inputs, _ = flatten((args, kwargs), lambda x: isinstance(x, RemoteRef))
+                for f in flat_inputs:
+                    if f not in defined:
+                        extra_actuals.append(f)
+                        formals.append(f)
+                        defined.add(f)
+                for t in tensor_results:
+                    defined.add(t)
 
             lines = []
             lines.append(f"def run({','.join(repr(f) for f in formals)}):")
             for func, args, kwargs, tensor_results, fake_results in commands:
                 arg_list = [*(repr(a) for a in args), *(f'{name}={repr(value)}' for name, value in kwargs.items())]
+                flat_inputs, _ = flatten((args, kwargs))
+
                 arg_strings = ', '.join(arg_list)
                 lhs = [repr(r) for r in tensor_results]
                 if isinstance(fake_results, (list, tuple)):
                     lhs_it = iter(lhs)
                     lhs = [next(lhs_it) if isinstance(fr, torch.Tensor) else "_" for fr in fake_results]
-
-                lines.append(f"    {', '.join(lhs)} = torch.ops.{str(func)}({arg_strings})")
-            lines.append(f"    return {','.join(repr(o._ref) for o in outputs_reference if o is not None)},") # outputs can be non-tensor?
+                lhs = f"{', '.join(lhs)} = " if lhs else ""
+                lines.append(f"    {lhs}torch.ops.{str(func)}({arg_strings})")
+            lines.append(f"    return [{','.join(repr(o._ref) for o in outputs_reference if o is not None)}]") # outputs can be non-tensor?
             lines.append("")
 
             code = '\n'.join(lines)
@@ -1161,18 +1178,29 @@ def _compile(graph, _):
                 worker.define_function(fn, code)
 
             def impl(actuals):
-                outputs = [DTensor(o._fake.clone(), RemoteRef(), o.sharding) if o is not None else None for o in outputs_reference]
+                # XXX: technically o._fake has to be cloned here for correctness but cloning is very slow
+                # our examples so far don't hit the potential bug (modify DTensor in place, which mutates the
+                # fake tensor)
+                outputs = [DTensor(o._fake, RemoteRef(), o.sharding) if o is not None else None for o in outputs_reference]
                 for worker in mesh.flat_workers:
-                    worker.run_function(fn, [a._ref for a in actuals], [o._ref for o in outputs if o is not None])
+                    worker.run_function(fn, [a._ref for a in actuals] + extra_actuals, [o._ref for o in outputs if o is not None])
                 return outputs
             sharding_cache[key] = impl
         return sharding_cache[key](inputs)
     wrapper._boxed_call = True
     return wrapper
 
-aot_dtensor = aot_autograd(fw_compiler=_compile, partition_fn=min_cut_rematerialization_partition)
+aot_dtensor = aot_autograd(fw_compiler=_compile_stage2, partition_fn=min_cut_rematerialization_partition)
 
+def _compile_stage1(graph, inputs):
+    if len(inputs) == 202:
+        # HACK: skip aot_autograd for the optimizer step in nanoGPT
+        wrapper = _compile_stage2(graph, inputs)
+        def wrapper_stage_2(*args):
+            return wrapper(args)
+        return wrapper_stage_2
+    return aot_dtensor(graph, inputs)
 
 
 def compile(*args, **kwargs):
-    return torch.compile(*args, backend=aot_dtensor, **kwargs)
+    return torch.compile(*args, backend=_compile_stage1, **kwargs)
