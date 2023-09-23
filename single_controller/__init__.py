@@ -23,7 +23,7 @@ from functorch.compile import min_cut_rematerialization_partition
 import tempfile
 import warnings
 
-from .config import check_correctness_per_operator, simulate_function_calls
+from .config import check_correctness_per_operator, simulate_function_calls, do_fake_mode_caching
 
 _py_compile = compile
 
@@ -302,6 +302,10 @@ def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtens
     return mesh, args, kwargs
 
 _trace = None
+fake_cache = {}
+
+def fake_key(f):
+    return (list(f.size()), f.device, f.dtype)
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     if func is torch.ops.aten.detach.default:
@@ -326,10 +330,21 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
 
     dtensors, unflatten = flatten((args, kwargs), is_dtensor_no_tensors)
 
-    with fake_mode:
-        fake_input_tensors =  [d._fake for d in dtensors]
-        fake_args, fake_kwargs = unflatten(fake_input_tensors)
-        result = func(*fake_args, **fake_kwargs)
+    fake_input_tensors = [d._fake for d in dtensors]
+    if _trace is None and do_fake_mode_caching:
+        fake_input_tensors_key =  [fake_key(d._fake) for d in dtensors]
+        fake_cache_key = str((id(func), unflatten(fake_input_tensors_key)))
+        result = fake_cache.get(fake_cache_key, None)
+        if result is None:
+            with fake_mode:
+                fake_args, fake_kwargs = unflatten(fake_input_tensors)
+                result = func(*fake_args, **fake_kwargs)
+            fake_cache[fake_cache_key] = result
+    else:
+        with fake_mode:
+            fake_args, fake_kwargs = unflatten(fake_input_tensors)
+            result = func(*fake_args, **fake_kwargs)
+
 
     fake_result_dtensors, unflatten_result = flatten(result, is_tensor)
     fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}

@@ -12,6 +12,8 @@ simulate_function_calls = False
 # worker will print what commands it is running before running them
 verbose_worker = False
 
+# keep a cache of fake tensors to speed things up
+do_fake_mode_caching = True
 
 if check_correctness_per_operator:
     simulate_function_calls = True
@@ -20,3 +22,5 @@ if check_correctness_per_operator:
 # them here to so they are easy to find
 nanogpt_use_single_controller = True
 nanogpt_compile = True
+
+assert nanogpt_compile or not do_fake_mode_caching, "somewhere in there there are problems with view operators"
