@@ -1,5 +1,5 @@
 import torch
-from single_machine import DTensor, active_sharding, Manager, to_local, Sharding, WorkerMesh, psum_, wait_pending_callbacks
+from single_machine import DTensor, active_sharding, Manager, to_local, Sharding, WorkerMesh, psum_, wait_pending_callbacks, stats
 import unittest
 from torch.testing import assert_close
 import subprocess
@@ -16,6 +16,7 @@ class TestSingleMachine(unittest.TestCase):
 
     def tearDown(self):
         wait_pending_callbacks()
+        stats.report()
 
     def test_operations(self):
         x = DTensor.to_remote(torch.ones(2, 2), sharding=self.w)

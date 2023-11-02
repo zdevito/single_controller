@@ -18,6 +18,15 @@ from queue import Queue
 
 from single_controller.config import check_correctness_per_operator, simulate_function_calls, do_fake_mode_caching
 
+class Stats:
+    def report(self):
+        print(self.__dict__)
+
+stats = Stats()
+stats.mode_change = 0
+stats.fake_tensor = 0
+stats.dispatched = 0
+
 if check_correctness_per_operator:
     class RealMode:
         def from_tensor(self, t):
@@ -234,36 +243,36 @@ def embedding_backward(args, kwargs, dtensor_input, dtensor_results, sharding_co
         dtensor_results[0]._sharding = Sharding(gradOutput.sharding.mesh, '+')
     return args, kwargs
 
+def all_implicit_or_replicated(sharding):
+    for ann in sharding.sharding:
+        if ann == '+' or isinstance(ann, int):
+            return False
+    return True
 
-def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding'):
-    mesh = dtensor_input[0]._sharding.mesh if dtensor_input else sharding_context.mesh
-
-    any_partial_or_explicit_shard = False
+def try_fast_propagate_sharding(dtensor_input, sharding_context, mesh):
+    can_fast_propagate = True if sharding_context is None else all_implicit_or_replicated(sharding_context)
     for d in dtensor_input:
         if d._sharding.mesh is not mesh:
             raise NotImplementedError("operation on tensors distributed on different device meshes")
-        for ann in d.sharding.sharding:
-            if ann == '+' or isinstance(ann, int):
-                any_partial_or_explicit_shard = True
+        can_fast_propagate = can_fast_propagate and all_implicit_or_replicated(d._sharding)
+    if not can_fast_propagate:
+        return None
+    # easy case, only implicit batching or replicated, so the rule is that things become
+    # implicitly batched if one input is implicitly batch in that mesh dimension
+    # otherwise they stay replicated
+    if sharding_context is not None:
+        sharding = sharding_context
+    else:
+        new_annotations = ['b' if any(e == 'b' for e in cross_input_annotations) else 'r' for cross_input_annotations in zip(*(d.sharding.sharding for d in dtensor_input))]
+        sharding = Sharding(mesh, new_annotations)
+    return sharding
 
-    if not any_partial_or_explicit_shard:
-        # easy case, only implicit batching or replicated, so the rule is that things become
-        # implicitly batched if one input is implicitly batch in that mesh dimension
-        # otherwise they stay replicated
-        if sharding_context is not None:
-            sharding = sharding_context
-        else:
-            new_annotations = ['b' if any(e == 'b' for e in cross_input_annotations) else 'r' for cross_input_annotations in zip(*(d.sharding.sharding for d in dtensor_input))]
-            sharding = Sharding(mesh, new_annotations)
-        for r in dtensor_results:
-            r._sharding = sharding
-        return mesh, args, kwargs
-
+def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtensor_results: 'List[DTensor]', sharding_context: 'Sharding', mesh):
     # fake cases
     key = str(func)
     if key in prules:
         args, kwargs = prules[key](args, kwargs, dtensor_input=dtensor_input, dtensor_results=dtensor_results, sharding_context=sharding_context)
-        return mesh, args, kwargs
+        return args, kwargs
 
     sharding_to_find(func, str(args), str(kwargs), str(dtensor_results))
     # totally fake for now, propagates the sharding pointwise if all the input shardings are the same or an input is fully replicated.
@@ -288,13 +297,13 @@ def propagate_sharding(func, args, kwargs, dtensor_input: 'List[DTensor]', dtens
     for r in dtensor_results:
         r._sharding = sharding
 
-    return mesh, args, kwargs
+    return args, kwargs
 
 def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
     if func is torch.ops.aten.detach.default:
         if not args[0].requires_grad:
             return args[0]
-
+    stats.dispatched += 1
     worker = sharding.mesh.flat_workers[0] if sharding else None
 
     def stringify(t):
@@ -312,9 +321,21 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
             raise NotImplementedError(f"mixed DTensor/local tensor {func}(args, kwargs)={tree_map(stringify, (args, kwargs))}")
 
     dtensors, unflatten = flatten((args, kwargs), is_dtensor_no_tensors)
+    mesh = dtensors[0]._sharding.mesh if dtensors else sharding.mesh
+
+    fast_prop_sharding = try_fast_propagate_sharding(dtensors, sharding, mesh)
+
+    for d in dtensors:
+        d.set_fake_is_first_worker(fast_prop_sharding is not None)
 
     fake_input_tensors = [d._fake for d in dtensors]
-    with fake_mode:
+    if fast_prop_sharding is None:
+        ctx = fake_mode
+        stats.fake_tensor += 1
+    else:
+        ctx = nullcontext()
+
+    with ctx:
         fake_args, fake_kwargs = unflatten(fake_input_tensors)
         result = func(*fake_args, **fake_kwargs)
 
@@ -323,8 +344,12 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
 
     # sometimes operators return references to inputs, in which case the result should be the same DTensor object
     # otherwise we create a new DTensor with a new RemoteRef for the result
-    result_dtensors = [dtensors[fake_map[id(fake)]] if id(fake) in fake_map else DTensor(fake, RemoteRef(), None) for fake in fake_result_dtensors]
-    mesh, modified_args, modified_kwargs = propagate_sharding(func, args, kwargs, dtensors, result_dtensors, sharding)
+    result_dtensors = [dtensors[fake_map[id(fake)]] if id(fake) in fake_map else DTensor(fake, RemoteRef(), fast_prop_sharding, fast_prop_sharding is not None) for fake in fake_result_dtensors]
+
+    if not fast_prop_sharding:
+        modified_args, modified_kwargs = propagate_sharding(func, args, kwargs, dtensors, result_dtensors, sharding, mesh)
+    else:
+        modified_args, modified_kwargs = args, kwargs
 
     for i, r in enumerate(result_dtensors):
         assert r._sharding is not None, f"sharding unset for output {i} of {str(func)} fake outputs: {fake_result_dtensors}"
@@ -334,7 +359,8 @@ def dtensor_dispatch(func, args=(), kwargs=None, sharding=None):
 
     ref_args, ref_kwargs = tree_map(get_ref, modified_args), tree_map(get_ref, modified_kwargs)
     ref_results = [r._ref for r in result_dtensors]
-    for worker in mesh.flat_workers:
+    workers = mesh.flat_workers if fast_prop_sharding is None else mesh.flat_workers[1:]
+    for worker in workers:
         worker.send_command(func, ref_args, ref_kwargs, ref_results)
 
     results = unflatten_result(result_dtensors)
@@ -346,7 +372,7 @@ class FakeTLS:
     pass
 # thread local doesn't quite work right because backwards pass runs in another thread
 # but we don't move the resource guard over there
-tls = FakeTLS() # thread.local()
+tls = threading.local()
 
 @contextmanager
 def active_sharding(sharding, force=False):
@@ -379,6 +405,7 @@ class _ActiveSharding(TorchDispatchMode):
         assert tls.sharding != 'inactive', "_ActiveSharding is enabled but set to inactive?"
         return dtensor_dispatch(func, args, kwargs, sharding=tls.sharding)
 
+
 class DTensor(BaseTensor):
     @staticmethod
     def __new__(
@@ -386,6 +413,7 @@ class DTensor(BaseTensor):
         fake: torch.Tensor,
         ref: RemoteRef,
         sharding: 'Optional[Sharding]',
+        fake_is_first_worker,
     ):
         r = torch.Tensor._make_wrapper_subclass(
             cls,
@@ -401,9 +429,10 @@ class DTensor(BaseTensor):
         r._fake = fake
         assert sharding is None or isinstance(sharding, Sharding)
         r._sharding = sharding
+        r._fake_is_first_worker = fake_is_first_worker
         return r
 
-    def __init__(self, fake, ref, worker):
+    def __init__(self, fake, ref, worker, fake_is_first_worker):
         pass
 
     @classmethod
@@ -452,7 +481,7 @@ class DTensor(BaseTensor):
                 worker = sharding.mesh._workers.workers[idx]
                 worker.send_value(r, local)
 
-        return DTensor(f, r, sharding)
+        return DTensor(f, r, sharding, False)
 
     def __repr__(self):
        return f"DTensor(sharding={self.sharding}, shape={list(self.shape)})"
@@ -465,12 +494,28 @@ class DTensor(BaseTensor):
         r = reconstruct_tensor(self)
         return Thunk(lambda: r())
 
+    def set_fake_is_first_worker(self, b):
+        if self._fake_is_first_worker == b:
+            return
+        stats.mode_change += 1
+        if b:
+            assert not any(isinstance(s, int) for s in self.sharding.sharding)
+            req =  self.sharding.mesh.flat_workers[0].request_value(self._ref)
+            self.sharding.mesh.flat_workers[0].del_value(self._ref)
+            self._fake = req.wait()
+        else:
+            v = self._fake
+            self._fake = fake_mode.from_tensor(v)
+            self.sharding.mesh.flat_workers[0].send_value(self._ref, v)
+        self._fake_is_first_worker = b
+
     def __del__(self):
         if sys is None:
             return # python shutdown
         if self._sharding is None:
             return # an error happening during construction and this wasn't initialized
-        for worker in self._sharding.mesh.flat_workers:
+        workers = self._sharding.mesh.flat_workers[1:] if self._fake_is_first_worker else self._sharding.mesh.flat_workers
+        for worker in workers:
             worker.del_value(self._ref)
 
     @property
@@ -488,6 +533,8 @@ def psum_(tensors, meshdim=0):
         tensors = [tensors]
     if not tensors:
         return
+    for t in tensors:
+        t.set_fake_is_first_worker(False)
     mesh = tensors[0]._sharding.mesh
     for i, d in enumerate(tensors):
         if d._sharding.mesh is not mesh:
@@ -520,12 +567,12 @@ def reconstruct_tensor(dtensor):
 
 
     mesh = WorkerMesh(mesh._workers, mesh.shape[tuple(mesh_indexing)])
-    futures = [worker.request_value(dtensor._ref) for worker in mesh.flat_workers]
+    futures = [worker.request_value(dtensor._ref) if i > 0 or not dtensor._fake_is_first_worker else dtensor._fake for i, worker in enumerate(mesh.flat_workers)]
     first_real_dim = len(dims)
 
     def reconstruct():
         nonlocal first_real_dim
-        local_values = [f.wait().cpu() for f in futures]
+        local_values = [(f.wait() if isinstance(f, Future) else f).cpu() for f in futures]
         local_value = torch.stack(local_values)
         reshaped = (*mesh.shape.size(), *local_value.size()[1:])
         local_value = torch.reshape(local_value, reshaped)
@@ -687,25 +734,28 @@ class ThreadWorker(Worker):
                 else:
                     raise ValueError(f"unknown command {command}")
 
+    def _send(self, *args):
+        self.queue.put(args)
+
     def send_command(self, func, args, kwargs, results):
-        self.queue.put(('send_command', func, args, kwargs, results))
+        self._send('send_command', func, args, kwargs, results)
 
     def request_value(self, ref: RemoteRef):
         f = Future()
-        self.queue.put(('request_value', ref, f))
+        self._send('request_value', ref, f)
         return f
 
     def send_value(self, ref: RemoteRef, value: torch.Tensor):
-        self.queue.put(('send_value', ref, value))
+        self._send('send_value', ref, value)
 
     def del_value(self, ref: RemoteRef):
-        self.queue.put(('del_value', ref))
+        self._send('del_value', ref)
 
     def create_process_group(self, rank, pg, pg_ref):
-        self.queue.put(('create_process_group', rank, pg, pg_ref))
+        self._send('create_process_group', rank, pg, pg_ref)
 
     def all_reduce_coalesced(self, refs: List[int], pg_ref: RemoteRef):
-        self.queue.put(('all_reduce_coalesced', refs, pg_ref))
+        self._send('all_reduce_coalesced', refs, pg_ref)
 
 
 

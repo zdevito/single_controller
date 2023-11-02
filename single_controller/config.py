@@ -24,3 +24,5 @@ nanogpt_use_single_controller = True
 nanogpt_compile = True
 
 assert nanogpt_compile or not do_fake_mode_caching, "somewhere in there there are problems with view operators"
+
+avoid_fake_mode_optimization = True
