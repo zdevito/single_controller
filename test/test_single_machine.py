@@ -150,5 +150,13 @@ class TestSingleMachine(unittest.TestCase):
         print(t.to_local().wait(), x[0:2] + x[2:4])
         assert_close(t.to_local().wait(), x[0:2] + x[2:4])
 
+    def test_in_place(self):
+        mesh = self.workers[0:2]
+        sharded = mesh.Sharding('b')
+        x = torch.arange(4*6).reshape(4, 6)
+        t = sharded.DTensor(x.clone())
+        with active_sharding(mesh.Sharding('r')):
+            t.add_(torch.ones(2, 6, dtype=torch.long))
+
 if __name__ == '__main__':
     unittest.main()
