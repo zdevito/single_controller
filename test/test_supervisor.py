@@ -2,7 +2,7 @@ from supervisor import Context
 import sys
 import subprocess
 import signal
-from concurrent.futures import as_completed
+from supervisor import as_completed
 from contextlib import contextmanager
 
 N = 2
@@ -28,18 +28,18 @@ with create_hosts():
     for p in pg:
         p.send('hello')
 
-    for f in as_completed([p.recv(lambda x: isinstance(x, int)) for p in pg]):
-        print(f.result())
+    try:
+        for i, f in as_completed([p.recv(lambda x: isinstance(x, int)) for p in pg], enumerate=True, timeout=3):
+            print(i, f.result())
+    except TimeoutError:
+        print("TIMEOUT")
 
-    futs = []
-    for p in pg:
-        f = p.returncode()
-        f.p = p # YUCK, I DO NOT LIKE HOW AS
-        futs.append(f)
-
-    for f in as_completed(futs):
-        code = f.result()
-        print(f.p.rank, " FINISHED WITH CODE", code)
+    try:
+        for i, f in as_completed([p.returncode() for p in pg], enumerate=True, timeout=1):
+            p = pg[i]
+            print(p.rank, " FINISHED WITH CODE", f.result())
+    except TimeoutError:
+        print("TIMEOUT")
 
     ctx.return_hosts(hosts)
 

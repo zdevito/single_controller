@@ -31,7 +31,7 @@ class Process:
         environ['WORLD_SIZE'] = str(world_size)
         environ['SUPERVISOR_PIPE'] = proc_addr
         environ['SUPERVISOR_IDENT'] = str(proc_id)
-        self.subprocess = subprocess.Popen(args, env=environ)
+        self.subprocess = subprocess.Popen(args, env=environ, start_new_session=True)
         self.fd = pidfd_open(self.subprocess.pid)
         self.proc_id_bytes = proc_id.to_bytes(8, byteorder='little')
         self.deferred_sends = []
@@ -112,7 +112,7 @@ class Host:
         expiry = time.time() + ABORT_INTERVAL
         ttl = ABORT_INTERVAL
         while ttl > 0 and self.process_table:
-            for s, _ in poller.poll(timeout=ttl):
+            for s, _ in self.poller.poll(timeout=ttl):
                 if isinstance(s, int):
                     self._fd_exit(s)
             ttl = time.time() - expiry
