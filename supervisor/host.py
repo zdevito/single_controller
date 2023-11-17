@@ -23,15 +23,32 @@ def pidfd_open(pid):
 # the supervisor.
 
 class Process:
-    def __init__(self, proc_id, rank, world_size, args, proc_addr):
+    def __init__(self, proc_comm, proc_id, rank, world_size, args, proc_addr):
         self.proc_id = proc_id
+        self.proc_comm = proc_comm
         environ = dict(os.environ)
         environ['RANK'] = str(rank)
         environ['WORLD_SIZE'] = str(world_size)
         environ['SUPERVISOR_PIPE'] = proc_addr
+        environ['SUPERVISOR_IDENT'] = str(proc_id)
         self.subprocess = subprocess.Popen(args, env=environ)
         self.fd = pidfd_open(self.subprocess.pid)
-        self.pid_bytes = self.subprocess.pid.to_bytes(4, byteorder='little')
+        self.proc_id_bytes = proc_id.to_bytes(8, byteorder='little')
+        self.deferred_sends = []
+
+    def _send(self, msg):
+        msg = pickle.dumps(msg)
+        if self.deferred_sends is not None:
+            self.deferred_sends.append(msg)
+        else:
+            self.proc_comm.send_multipart([self.proc_id_bytes, msg])
+
+    def _notify_connected(self):
+        if self.deferred_sends is not None:
+            for msg in self.deferred_sends:
+                self.proc_comm.send_multipart([self.proc_id_bytes, msg])
+            self.deferred_sends = None
+
 
 
 class Host:
@@ -60,18 +77,20 @@ class Host:
     # TODO: validate these are valid messages to send
 
     def launch(self, proc_id, rank, world_size, args):
-        process = Process(proc_id, rank, world_size, args, self.proc_addr)
-        self.process_table[process.pid_bytes] = process
-        self.fd_to_pid[process.fd] = process.pid_bytes
+        process = Process(self.proc_comm, proc_id, rank, world_size, args, self.proc_addr)
+        self.process_table[process.proc_id_bytes] = process
+        self.fd_to_pid[process.fd] = process.proc_id_bytes
         self.poller.register(process.fd, zmq.POLLIN)
         self.backend.send(pickle.dumps(('_started', process.proc_id, process.subprocess.pid)))
 
     def send(self, proc_id, msg):
+        proc_id = proc_id.to_bytes(8, byteorder='little')
         if proc_id in self.process_table:
             process = self.process_table[proc_id]
-            self.proc_comm.send_multipart([process.pid_bytes, pickle.dumps(msg)])
+            process._send(msg)
 
     def signal(self, proc_id, sig, group):
+        proc_id = proc_id.to_bytes(8, byteorder='little')
         if proc_id in self.process_table:
             process = self.process_table[proc_id]
             if group:
@@ -116,9 +135,11 @@ class Host:
                     cmd, *args = pickle.loads(self.backend.recv())
                     getattr(self, cmd)(*args)
                 elif s is self.proc_comm:
-                    pid_bytes, msg = proc_comm.recv_multipart()
-                    process = self.process_table[pid_bytes]
-                    self.backend.send(pickle.dumps(('_response', process.proc_id, msg)))
+                    proc_id_bytes, msg = self.proc_comm.recv_multipart()
+                    process = self.process_table[proc_id_bytes]
+                    process._notify_connected()
+                    if len(msg):
+                        self.backend.send(pickle.dumps(('_response', process.proc_id, msg)))
 
             if time.time() > heartbeat_at:
                 heartbeat_at = time.time() + HEARTBEAT_INTERVAL

@@ -25,6 +25,12 @@ with create_hosts():
     hosts = ctx.request_hosts(n=N).result()
     pg = ctx.create_process_group(hosts, args=['python', '-m', 'supervisor.simple_example_program'], npp=3)
 
+    for p in pg:
+        p.send('hello')
+
+    for f in as_completed([p.recv(lambda x: isinstance(x, int)) for p in pg]):
+        print(f.result())
+
     futs = []
     for p in pg:
         f = p.returncode()

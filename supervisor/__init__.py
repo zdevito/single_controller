@@ -32,7 +32,7 @@ class Host:
         self.expiry = None
         self._name = None
         self._connected = False
-        self._deferred_launches = []
+        self._deferred_sends = []
         self._proc_table = {}
 
     def _heartbeat(self):
@@ -41,31 +41,31 @@ class Host:
     def _connect(self, name):
         self._name = name
         self._connected = True
-        for p in self._deferred_launches:
-            self._launch(p)
-        self._deferred_launches.clear()
+        for msg in self._deferred_sends:
+            self._context._backend.send_multipart([self._name, msg])
+        self._deferred_sends.clear()
 
     def _disconnect(self):
         self._connected = False
         for p in self._proc_table.values():
             p._lost_host()
-        for p in self._deferred_launches:
-            p._lost_host()
 
         # is there value in keeping this around for a reconnect?
         self._proc_table.clear()
-        self._deferred_launches.clear()
+        self._deferred_sends.clear()
 
     def _debug_dict(self):
         return self.__dict__
 
-    def _launch(self, p):
+    def _send(self, msg):
         if not self._connected:
-            self._deferred_launches.append(p)
-            return
-        self._context._backend.send_multipart([self._name, pickle.dumps(('launch', id(p), p.rank, p.world_size, p.args))])
-        self._proc_table[id(p)] = p
+            self._deferred_sends.append(msg)
+        else:
+            self._context._backend.send_multipart([self._name, msg])
 
+    def _launch(self, p):
+        self._proc_table[id(p)] = p
+        self._send(pickle.dumps(('launch', id(p), p.rank, p.world_size, p.args)))
 
 class Process:
     def __init__(self, context, host, rank, world_size, args):
@@ -99,26 +99,27 @@ class Process:
         for _, f in self._recvs:
             yield f
 
-    def send(msg: Any):
+    def send(self, msg: Any):
         self._context._schedule(lambda: self._send(msg))
 
-    def _send(msg: Any):
+    def _send(self, msg: Any):
         if self._alive:
-            self._context._backend.send_multipart([self.host._name, pickle.dumps(('send', id(self), msg))])
+            self.host._send(pickle.dumps(('send', id(self), msg)))
 
     def signal(self, signal=signal.SIGTERM):
         self._context._schedule(lambda: self._signal(signal))
 
     def _signal(self, signal):
         if self._alive:
-            self._context._backend.send_multipart([self.host._name, pickle.dumps(('signal', id(self), signal))])
+            self.host._send(self.host._name, pickle.dumps(('signal', id(self), signal)))
 
     # return first response where filter(msg) is True
-    def recv(filter: callable) -> 'Future[Any]':
+    def recv(self, filter: callable) -> 'Future[Any]':
         fut = Future()
         self._context._schedule(lambda: self._recv(fut, filter))
+        return fut
 
-    def _recv(fut: Future, filter: callable):
+    def _recv(self, fut: Future, filter: callable):
         for i, msg in enumerate(self._messages):
             if filter(msg):
                 self._messages.pop(i)
@@ -133,7 +134,8 @@ class Process:
     # TODO: annotation that registers this as a valid
     # message that can be sent
 
-    def _response(msg):
+    def _response(self, msg):
+        msg = pickle.loads(msg)
         for i, (filt, fut) in enumerate(self._recvs):
             if filt(msg):
                 self._recvs.pop(i)
@@ -143,6 +145,7 @@ class Process:
 
     def _exited(self, returncode):
         self._returncode.set_result(returncode)
+
     def _started(self, pid):
         self._pid.set_result(pid)
 
