@@ -9,6 +9,7 @@ import time
 import signal
 import pickle
 import logging
+import os
 
 LOGGER = logging.getLogger("concurrent.futures")
 
@@ -242,6 +243,9 @@ class Host:
         self._proc_table[id(p)] = p
         self._send(pickle.dumps(('launch', id(p), p.rank, p.world_size, p.args)))
 
+    def __repr__(self):
+        return f"Host({self._name})"
+
 class Process:
     def __init__(self, context, host, rank, world_size, args):
         self._context = context
@@ -260,6 +264,10 @@ class Process:
 
     def pid(self) -> 'Future[int]':
         return self._pid
+
+    def __repr__(self):
+        pid = self._pid.result() if self._pid.done() and not self._pid.exception() else None
+        return f"Process(rank={self.rank}, host={self.host}, pid={pid})"
 
     def _lost_host(self):
         self._alive = False
@@ -281,15 +289,15 @@ class Process:
         if self._alive:
             self.host._send(pickle.dumps(('send', id(self), msg)))
 
-    def signal(self, signal=signal.SIGTERM):
-        self._context._schedule(lambda: self._signal(signal))
+    def signal(self, signal=signal.SIGTERM, group=True):
+        self._context._schedule(lambda: self._signal(signal, group))
 
-    def _signal(self, signal):
+    def _signal(self, signal, group):
         if self._alive:
-            self.host._send(self.host._name, pickle.dumps(('signal', id(self), signal)))
+            self.host._send(pickle.dumps(('signal', id(self), signal, group)))
 
     # return first response where filter(msg) is True
-    def recv(self, filter: callable) -> 'Future[Any]':
+    def recv(self, filter: callable=lambda x: True) -> 'Future[Any]':
         fut = Future(self._context)
         self._context._schedule(lambda: self._recv(fut, filter))
         return fut
@@ -466,7 +474,7 @@ class Context:
         # if the host is still connected, then send the host a message
         # then cancel is processes and abort with an error to get the
         # the scheduler to reassign the host
-        self._context._schedule(lambda: self._replace_hosts(hosts))
+        self._schedule(lambda: self._replace_hosts(hosts))
 
     def _replace_hosts(self, hosts):
         for h in hosts:
@@ -505,3 +513,20 @@ class Context:
                     self._doorbell.recv()
                     yield self._finished_futures.popleft()
                 t = time.time()
+
+
+def get_message_queue():
+    """
+    Processes launched on the hosts can use this function to connect
+    to the messaging queue of the supervisor.
+
+    Messages send from here can be received by the supervisor using
+    `proc.recv()` and messages from proc.send() will appear in this queue.
+    """
+    ctx = zmq.Context(1)
+    sock = ctx.socket(zmq.DEALER)
+    proc_id = int(os.environ['SUPERVISOR_IDENT']).to_bytes(8, byteorder='little')
+    sock.setsockopt(zmq.IDENTITY, proc_id)
+    sock.connect(os.environ['SUPERVISOR_PIPE'])
+    sock.send(b'')
+    return sock

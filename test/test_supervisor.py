@@ -35,8 +35,9 @@ with create_hosts():
         print("TIMEOUT")
 
     try:
-        for i, f in as_completed([p.returncode() for p in pg], enumerate=True, timeout=1):
-            p = pg[i]
+        d = {p.returncode(): p for p in pg}
+        for f in as_completed(d.keys(), timeout=1):
+            p = d[f]
             print(p.rank, " FINISHED WITH CODE", f.result())
     except TimeoutError:
         print("TIMEOUT")

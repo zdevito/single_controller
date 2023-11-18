@@ -106,7 +106,7 @@ class Host:
         os.close(fd)
         return process, returncode
 
-    def abort(self, with_error):
+    def shutdown(self):
         for proc in self.process_table.values():
             os.killpg(proc.subprocess.pid, signal.SIGTERM)
         expiry = time.time() + ABORT_INTERVAL
@@ -119,6 +119,9 @@ class Host:
         if self.process_table:
             for proc in self.process_table.values():
                 os.killpg(proc.subprocess.pid, signal.SIGKILL)
+
+    def abort(self, with_error):
+        self.shutdown()
         if with_error:
             raise ConnectionAbortedError("Supervisor aborted host")
         else:
@@ -147,4 +150,12 @@ class Host:
 
 if __name__ == '__main__':
     manager = Host(sys.argv[1])
-    manager.run_event_loop_forever()
+    def handler(signal, frame):
+        manager.shutdown()
+        sys.exit(1)
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+    try:
+        manager.run_event_loop_forever()
+    finally:
+        manager.shutdown()
