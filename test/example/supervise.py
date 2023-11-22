@@ -42,6 +42,10 @@ def start_training(hosts: List[Host]):
     print(f"Found {to_rank} hosts that passed health checks, ranking...")
     to_rank = sorted(to_rank, key=lambda x: x[0])
 
+    # TODO NEXT: if we end up with too few hosts to start,
+    # try to replace them and retry, because right now we get
+    # stuck with hosts that have disconnected but not marked for replacement
+    # yet
     if len(to_rank) < desired_run_size:
         raise Exception('Not enough healthy hosts')
 
@@ -51,7 +55,7 @@ def start_training(hosts: List[Host]):
     print(f"Chose hosts: {[p.rank for _, p in good]}")
 
     # Let's get training started.
-    process_group = ctx.create_process_group(good_hosts, args=['python', '-m', 'train'], npp=8)
+    process_group = ctx.create_process_group(good_hosts, args=['python', '-m', 'train'], npp=1)
 
     # now simultaneously with training lets sort out what to do with our
     # stragglers. slow hosts are probably ok to keep, they responded
@@ -80,7 +84,7 @@ def start_training(hosts: List[Host]):
     # if it is unhealthy. That new instance of the host manager will
     # check in with the supervisor with assign it to unconnected host.
 
-    return process_group
+    return process_group, good_hosts
 
 def healthy(score):
     return score.exception() is None and score.result() < 4
@@ -100,13 +104,15 @@ if __name__ == '__main__':
     # request and wait for the hosts to get provided.
     hosts: List[Host] = ctx.request_hosts(n=N).result()
     while True:
-        process_group: List[Process] = start_training(hosts)
+        process_group, current_hosts = start_training(hosts)
+
         for f in as_completed([f.returncode() for f in process_group]):
             if f.exception() is not None or f.result() != 0:
                 print("Training has failed, attempting restart...")
                 # training has failed, clean up the training processes
                 for p in process_group:
                     p.signal(signal.SIGTERM) # TODO: maybe have a broadcasting signal function.
+                ctx.replace_hosts(h for h in current_hosts if h.connection_lost())
                 # policy-wise, there are a few ways to move forward
                 # we can try to ensure all the signals were delivered
                 # and the processes were killed, following up

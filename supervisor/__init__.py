@@ -23,12 +23,15 @@ class Future:
     def __init__(self, context):
         self._context = context
         """Initializes the future. Should not be called by clients."""
+        self._complete = False
         self._value = None
         self._was_exception = False
         self._done_callbacks = []
 
     def done(self):
-        return self._value is not None
+        # wait 0 just polls to see if the done message
+        # is already in the message queue
+        return self._wait(0)
 
     def add_done_callback(self, fn):
         """Attaches a callable that will be called when the future finishes.
@@ -60,14 +63,14 @@ class Future:
             return self._value
 
     def _wait(self, timeout):
-        if self.done():
-            return
+        if self._complete:
+            return True
         for futs in self._context._generate_futures(timeout):
             for f, value, was_exception in futs:
                 f._set_value(value, was_exception)
-            if self.done():
-                return
-        raise TimeoutError()
+            if self._complete:
+                return True
+        return False
 
     def _invoke_callbacks(self):
         for callback in self._done_callbacks:
@@ -93,8 +96,9 @@ class Future:
             Exception: If the call raised then that exception will be raised.
         """
         try:
-            self._wait(timeout)
-            return self.__get_result()
+            if self._wait(timeout):
+                return self.__get_result()
+            raise TimeoutError()
         finally:
             # Break a reference cycle with the exception in self._exception
             self = None
@@ -116,8 +120,9 @@ class Future:
             TimeoutError: If the future didn't finish executing before the given
                 timeout.
         """
-        self._wait(timeout)
-        return self._value if self._was_exception else None
+        if self._wait(timeout):
+            return self._value if self._was_exception else None
+        raise TimeoutError()
 
     # called on user thread to modify future state
     def _set_value(self, value, was_exception):
@@ -125,8 +130,9 @@ class Future:
 
         Should only be used by Executor implementations and unit tests.
         """
-        if self.done():
-            raise InvalidStateError('Future already completed')
+        if self._complete:
+            raise ValueError('Future already completed')
+        self._complete = True
         self._value = value
         self._was_exception = was_exception
         self._invoke_callbacks()
@@ -207,44 +213,56 @@ class Host:
         self._context = context
         self.expiry = None
         self._name = None
-        self._connected = False
+        self._state = 'unconnected'
         self._deferred_sends = []
         self._proc_table = {}
+        self._on_connection_lost = Future(context)
 
     def _heartbeat(self):
         self.expiry = time.time() + HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
 
     def _connect(self, name):
+        self._context._name_to_host[name] = self
+        self._state = 'connected'
         self._name = name
-        self._connected = True
         for msg in self._deferred_sends:
             self._context._backend.send_multipart([self._name, msg])
         self._deferred_sends.clear()
 
     def _disconnect(self):
-        self._connected = False
+        self._state = 'lost'
         for p in self._proc_table.values():
             p._lost_host()
 
         # is there value in keeping this around for a reconnect?
         self._proc_table.clear()
-        self._deferred_sends.clear()
+        self._on_connection_lost.set_result(None)
 
     def _debug_dict(self):
         return self.__dict__
 
     def _send(self, msg):
-        if not self._connected:
+        if self._state == 'unconnected':
             self._deferred_sends.append(msg)
         else:
             self._context._backend.send_multipart([self._name, msg])
 
     def _launch(self, p):
+        if self._state == "lost":
+            # launch after we lost connection to this host.
+            p._lost_host()
+            return
         self._proc_table[id(p)] = p
         self._send(pickle.dumps(('launch', id(p), p.rank, p.world_size, p.args)))
 
     def __repr__(self):
         return f"Host({self._name})"
+
+    def on_connection_lost(self):
+        return self._on_connection_lost
+
+    def connection_lost(self):
+        return self._on_connection_lost.done()
 
 class Process:
     def __init__(self, context, host, rank, world_size, args):
@@ -257,7 +275,7 @@ class Process:
         self._returncode = Future(context)
         self._recvs = []
         self._messages = []
-        self._alive = True
+        self._state = 'launched'
 
     def returncode(self) -> 'Future[int]':
         return self._returncode
@@ -270,30 +288,28 @@ class Process:
         return f"Process(rank={self.rank}, host={self.host}, pid={pid})"
 
     def _lost_host(self):
-        self._alive = False
         e = ConnectionAbortedError("Lost connection to process host")
-        for f in self._futures():
-            if not f.done():
-                f.set_exception(e)
-
-    def _futures(self):
-        yield self._pid
-        yield self._returncode
+        if self._state == 'launched':
+            self._pid.set_exception(e)
+        if self._state in ['launched', 'running']:
+            self._returncode.set_exception(e)
         for _, f in self._recvs:
-            yield f
+            f.set_exception(e)
+        self._recvs.clear()
+        self._state = 'aborted'
 
     def send(self, msg: Any):
         self._context._schedule(lambda: self._send(msg))
 
     def _send(self, msg: Any):
-        if self._alive:
+        if self._state != 'aborted':
             self.host._send(pickle.dumps(('send', id(self), msg)))
 
     def signal(self, signal=signal.SIGTERM, group=True):
         self._context._schedule(lambda: self._signal(signal, group))
 
     def _signal(self, signal, group):
-        if self._alive:
+        if self._state != 'aborted':
             self.host._send(pickle.dumps(('signal', id(self), signal, group)))
 
     # return first response where filter(msg) is True
@@ -308,11 +324,10 @@ class Process:
                 self._messages.pop(i)
                 fut.set_result(msg)
                 return
-        if self._alive:
-            self._recvs.append((filter, fut))
+        if self._state == 'aborted':
+            fut.set_exception(ConnectionAbortedError("Lost connection to process host"))
         else:
-            fut.set_exception(ValueError("process no longer alive"))
-
+            self._recvs.append((filter, fut))
 
     # TODO: annotation that registers this as a valid
     # message that can be sent
@@ -327,9 +342,11 @@ class Process:
         self._messages.append(msg)
 
     def _exited(self, returncode):
+        self._state = 'exited'
         self._returncode.set_result(returncode)
 
     def _started(self, pid):
+        self._state = 'running'
         self._pid.set_result(pid)
 
 
@@ -381,12 +398,17 @@ class Context:
                             host = Host(self)
                             self._unassigned_connections.append(host)
                         host._connect(f)
-                        self._name_to_host[f] = host
-                        print(f"New Client: {f}")
                     else:
                         host = self._name_to_host[f]
                     host._heartbeat()
-                    if len(msg):
+                    if host._state == 'lost':
+                        # got a message from a host that expired, but
+                        # eventually came back to life
+                        # At this point we've marked its processes as dead
+                        # so we are going to tell it to abort so that it gets
+                        # restarted and can become a new connection.
+                        self._send_abort(host, True)
+                    elif len(msg):
                         cmd, proc_id, *args = pickle.loads(msg)
                         # TODO: we shouldn't fail if we get proc_id's that do not exist
                         # they may have gotten delivered after we marked the processes as dead
@@ -405,7 +427,7 @@ class Context:
                 self._last_heartbeat_check = t
                 # priority queue would be log(N)
                 for key, host in self._name_to_host.items():
-                    if host._connected and host.expiry < t:
+                    if host._state == 'connected' and host.expiry < t:
                         host._disconnect()
                 # pprint(debug_dict(self))
 
@@ -415,6 +437,9 @@ class Context:
     def _schedule(self, fn):
         self._requests.append(fn)
         self._doorbell.send(b'')
+
+    def _send_abort(self, host, with_error):
+        self._backend.send_multipart([host._name, pickle.dumps(('abort', True))])
 
     def request_hosts(self, n: int) -> 'Future[List[Host]]':
         """
@@ -438,17 +463,20 @@ class Context:
             host = self._unassigned_connections.popleft()
             # its possible this connection timed out in the
             # meantime
-            if host.name is not None:
+            if host._state == 'connected':
                 return host
         return None
 
+    def _request_host(self, h):
+        u = self._next_connection()
+        if u is None:
+            self._unassigned_hosts.append(h)
+        else:
+            h._connect(u._name)
+
     def _request_hosts(self, hosts):
         for h in hosts:
-            u = self._next_connection()
-            if u is None:
-                self._unassigned_hosts.append(h)
-            else:
-                h._connect(u.name)
+            self._request_host(h)
 
     def return_hosts(self, hosts: List[Host]):
         """
@@ -459,8 +487,10 @@ class Context:
 
     def _return_hosts(self, hosts: List[Host]):
         for h in hosts:
-            if h._connected:
-                self._backend.send_multipart([h._name, pickle.dumps(('abort', False))])
+            # XXX: this fails to return a host if it was
+            # not connected when it was returned.
+            if h._state == 'connected':
+                self._send_abort(h, False)
                 h._disconnect()
 
     def replace_hosts(self, hosts: List[Host]):
@@ -478,14 +508,14 @@ class Context:
 
     def _replace_hosts(self, hosts):
         for h in hosts:
-            if h._connected:
-                self._backend.send_multipart([h._name, pickle.dumps(('abort', True))])
+            if h._state == 'connected':
+                self._send_abort(h, True)
                 h._disconnect()
             # detach this host object from current name
             self._name_to_host[h._name] = Host(self)
-            h._name = None
+            h.__init__(self)
             # let it get assigned to the next host to checkin
-            self._unassigned_hosts.append(h)
+            self._request_host(h)
 
 
 
@@ -503,6 +533,10 @@ class Context:
     def _generate_futures(self, timeout=None) -> 'Generator[List[Future]]':
         if timeout is None:
             while True:
+                self._doorbell.recv()
+                yield self._finished_futures.popleft()
+        elif timeout == 0:
+            while self._doorbell_poller.poll(0):
                 self._doorbell.recv()
                 yield self._finished_futures.popleft()
         else:
