@@ -1,3 +1,6 @@
+import logging
+logging.basicConfig(format='%(asctime)s %(levelname)s:%(name)s:%(message)s', level=logging.INFO)
+
 from supervisor import Context, Host, Process, Future
 from typing import List, Dict, Any
 import sys
@@ -5,6 +8,7 @@ import subprocess
 import signal
 from supervisor import as_completed
 from contextlib import contextmanager
+
 
 def start_training(hosts: List[Host]):
     # we will use 10% of machines as fallover machines.

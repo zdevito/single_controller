@@ -12,7 +12,7 @@ import logging
 import os
 import weakref
 
-LOGGER = logging.getLogger("concurrent.futures")
+logger = logging.getLogger("concurrent.futures")
 
 
 HEARTBEAT_LIVENESS = 3     # 3..5 is reasonable
@@ -51,7 +51,7 @@ class Future:
             try:
                 fn(self)
             except Exception:
-                LOGGER.exception('exception calling callback for %r', self)
+                logger.exception('exception calling callback for %r', self)
 
     def __get_result(self):
         if self._was_exception:
@@ -78,7 +78,7 @@ class Future:
             try:
                 callback(self)
             except Exception:
-                LOGGER.exception('exception calling callback for %r', self)
+                logger.exception('exception calling callback for %r', self)
 
     def result(self, timeout=None):
         """Return the result of the call that the future represents.
@@ -420,6 +420,7 @@ class Context:
                         # At this point we've marked its processes as dead
                         # so we are going to tell it to abort so that it gets
                         # restarted and can become a new connection.
+                        logger.info("Host %s that was lost reconnected, sending abort", host._name)
                         self._send_abort(host, True)
                     elif len(msg):
                         cmd, proc_id, *args = pickle.loads(msg)
@@ -429,6 +430,7 @@ class Context:
                             # no longer has a handle to the Process object
                             # in which case they are ok to just drop
                             assert proc_id >= 0 and proc_id < self._next_id, "unexpected proc_id"
+                            logger.info("Received message %s from process %s after local handle deleted", cmd, proc_id)
                         else:
                             getattr(proc, cmd)(*args)
 
@@ -442,16 +444,25 @@ class Context:
             _time_process += time_end - time_poll
             t = time.time()
             if t - self._last_heartbeat_check > HEARTBEAT_INTERVAL*2:
-                elaspsed = t - self._last_heartbeat_check
+                elapsed = t - self._last_heartbeat_check
                 self._last_heartbeat_check = t
                 # priority queue would be log(N)
                 for key, host in self._name_to_host.items():
                     if host._state == 'connected' and host.expiry < t:
                         # host timeout
+                        logger.warning("Host %s has not heartbeated in %s seconds, disconnecting it", host._name, elapsed)
                         host._disconnect()
-                print("TIME: ", _time_poll / elaspsed, _time_process / elaspsed)
+                self.logstatus(_time_poll / elapsed, _time_process / elapsed)
                 _time_poll = 0
                 _time_process = 0
+
+    def logstatus(self, poll_fraction, active_fraction):
+        host_histogram = {}
+        for h in self._name_to_host.values():
+            host_histogram[h._state] = host_histogram.setdefault(h._state, 0) + 1
+        logger.info("supervisor status: %s process launches, %s exits, %s host handles without hosts, %s connected hosts with handles, %s time spent polling, %s time spent active, hosts %s",
+         self._launches, self._exits, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
+
 
     def _debug_dict(self):
         return self.__dict__
@@ -534,7 +545,8 @@ class Context:
                 self._send_abort(h, True)
                 h._disconnect()
             # detach this host object from current name
-            self._name_to_host[h._name] = Host(self)
+            old = self._name_to_host[h._name] = Host(self)
+            old._disconnect()
             h.__init__(self)
             # let it get assigned to the next host to checkin
             self._request_host(h)
