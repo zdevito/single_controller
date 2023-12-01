@@ -10,6 +10,7 @@ import signal
 import pickle
 import logging
 import os
+import weakref
 
 LOGGER = logging.getLogger("concurrent.futures")
 
@@ -215,7 +216,7 @@ class Host:
         self._name = None
         self._state = 'unconnected'
         self._deferred_sends = []
-        self._proc_table = {}
+        self._proc_table = weakref.WeakValueDictionary()
         self._on_connection_lost = Future(context)
 
     def _heartbeat(self):
@@ -252,8 +253,9 @@ class Host:
             # launch after we lost connection to this host.
             p._lost_host()
             return
-        self._proc_table[id(p)] = p
-        self._send(pickle.dumps(('launch', id(p), p.rank, p.world_size, p.args)))
+        self._proc_table[p._id] = p
+        self._send(pickle.dumps(('launch', p._id, p.rank, p.world_size, p.args, p.simulate)))
+        self._context._launches += 1
 
     def __repr__(self):
         return f"Host({self._name})"
@@ -265,11 +267,14 @@ class Host:
         return self._on_connection_lost.done()
 
 class Process:
-    def __init__(self, context, host, rank, world_size, args):
+    def __init__(self, context, host, rank, world_size, args, simulate):
+        self._id = context._next_id
+        context._next_id += 1
         self._context = context
         self.host = host
         self.rank = rank
         self.args = args
+        self.simulate = simulate
         self.world_size = world_size
         self._pid = Future(context)
         self._returncode = Future(context)
@@ -303,14 +308,14 @@ class Process:
 
     def _send(self, msg: Any):
         if self._state != 'aborted':
-            self.host._send(pickle.dumps(('send', id(self), msg)))
+            self.host._send(pickle.dumps(('send', self._id, msg)))
 
     def signal(self, signal=signal.SIGTERM, group=True):
         self._context._schedule(lambda: self._signal(signal, group))
 
     def _signal(self, signal, group):
         if self._state != 'aborted':
-            self.host._send(pickle.dumps(('signal', id(self), signal, group)))
+            self.host._send(pickle.dumps(('signal', self._id, signal, group)))
 
     # return first response where filter(msg) is True
     def recv(self, filter: callable=lambda x: True) -> 'Future[Any]':
@@ -344,15 +349,15 @@ class Process:
     def _exited(self, returncode):
         self._state = 'exited'
         self._returncode.set_result(returncode)
+        self._context._exits += 1
 
     def _started(self, pid):
         self._state = 'running'
         self._pid.set_result(pid)
 
-
 class Context:
     def __init__(self):
-        self._context = zmq.Context()
+        self._context = zmq.Context(1)
 
         # to talk to python clients in this process
         self._requests = deque()
@@ -380,13 +385,21 @@ class Context:
 
         self._thread = Thread(target=self._event_loop, daemon=True)
         self._thread.start()
+        self._next_id = 0
+        self._exits = 0
+        self._launches = 0
 
     def _event_loop(self):
+        _time_poll = 0
+        _time_process = 0
         while True:
+            time_begin = time.time()
+            poll_result = self._poller.poll(timeout=HEARTBEAT_INTERVAL*1000*2)
+            time_poll = time.time()
             if self._finished_futures[-1]:
                 self._finished_futures.append([])
                 self._requests_ready.send(b'')
-            for sock, _ in self._poller.poll(timeout=HEARTBEAT_INTERVAL*1000*2):
+            for sock, _ in poll_result:
                 if sock is self._backend:
                     f, msg = self._backend.recv_multipart()
                     if f not in self._name_to_host:
@@ -410,26 +423,35 @@ class Context:
                         self._send_abort(host, True)
                     elif len(msg):
                         cmd, proc_id, *args = pickle.loads(msg)
-                        # TODO: we shouldn't fail if we get proc_id's that do not exist
-                        # they may have gotten delivered after we marked the processes as dead
-                        # alternatively we tombstone the proc_ids instead of deleting them
-                        proc = host._proc_table[proc_id]
-                        getattr(proc, cmd)(*args)
+                        proc = host._proc_table.get(proc_id)
+                        if proc is None:
+                            # messages from a process might arrive after the user
+                            # no longer has a handle to the Process object
+                            # in which case they are ok to just drop
+                            assert proc_id >= 0 and proc_id < self._next_id, "unexpected proc_id"
+                        else:
+                            getattr(proc, cmd)(*args)
 
                 elif sock is self._requests_ready:
                     while self._requests:
                         self._requests_ready.recv()
                         fn = self._requests.popleft()
                         fn()
-
+            time_end = time.time()
+            _time_poll += time_poll - time_begin
+            _time_process += time_end - time_poll
             t = time.time()
             if t - self._last_heartbeat_check > HEARTBEAT_INTERVAL*2:
+                elaspsed = t - self._last_heartbeat_check
                 self._last_heartbeat_check = t
                 # priority queue would be log(N)
                 for key, host in self._name_to_host.items():
                     if host._state == 'connected' and host.expiry < t:
+                        # host timeout
                         host._disconnect()
-                # pprint(debug_dict(self))
+                print("TIME: ", _time_poll / elaspsed, _time_process / elaspsed)
+                _time_poll = 0
+                _time_process = 0
 
     def _debug_dict(self):
         return self.__dict__
@@ -520,9 +542,9 @@ class Context:
 
 
     # TODO: other arguments like environment, etc.
-    def create_process_group(self, hosts: List[Host], args, npp=1) -> List[Process]:
+    def create_process_group(self, hosts: List[Host], args, npp=1, simulate=False) -> List[Process]:
         world_size = npp*len(hosts)
-        procs = tuple(Process(self, h, i*npp + j, world_size, args) for i, h in enumerate(hosts) for j in range(npp))
+        procs = tuple(Process(self, h, i*npp + j, world_size, args, simulate) for i, h in enumerate(hosts) for j in range(npp))
         self._schedule(lambda: self._launch_processes(procs))
         return procs
 

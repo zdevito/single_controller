@@ -70,13 +70,20 @@ class Host:
 
         self.process_table = {}
         self.fd_to_pid = {}
+        self._launches = 0
 
     def heartbeat(self):
         self.backend.send(b'')
 
     # TODO: validate these are valid messages to send
 
-    def launch(self, proc_id, rank, world_size, args):
+    def launch(self, proc_id, rank, world_size, args, simulate):
+        self._launches += 1
+        if simulate:
+            self.backend.send(pickle.dumps(('_started', proc_id, 2)))
+            self.backend.send(pickle.dumps(('_exited', proc_id, 0)))
+            return
+
         process = Process(self.proc_comm, proc_id, rank, world_size, args, self.proc_addr)
         self.process_table[process.proc_id_bytes] = process
         self.fd_to_pid[process.fd] = process.proc_id_bytes
