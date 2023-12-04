@@ -12,7 +12,7 @@ import logging
 import os
 import weakref
 
-logger = logging.getLogger("concurrent.futures")
+logger = logging.getLogger(__name__)
 
 
 HEARTBEAT_LIVENESS = 3     # 3..5 is reasonable
@@ -430,7 +430,7 @@ class Context:
                             # no longer has a handle to the Process object
                             # in which case they are ok to just drop
                             assert proc_id >= 0 and proc_id < self._next_id, "unexpected proc_id"
-                            logger.info("Received message %s from process %s after local handle deleted", cmd, proc_id)
+                            logger.debug("Received message %s from process %s after local handle deleted", cmd, proc_id)
                         else:
                             getattr(proc, cmd)(*args)
 
@@ -545,7 +545,8 @@ class Context:
                 self._send_abort(h, True)
                 h._disconnect()
             # detach this host object from current name
-            old = self._name_to_host[h._name] = Host(self)
+            old = Host(self)
+            old._connect(h._name)
             old._disconnect()
             h.__init__(self)
             # let it get assigned to the next host to checkin

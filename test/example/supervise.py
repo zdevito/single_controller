@@ -9,8 +9,9 @@ import signal
 from supervisor import as_completed
 from contextlib import contextmanager
 
+logger = logging.getLogger(__name__)
 
-def start_training(hosts: List[Host]):
+def start_training(hosts: List[Host], npp: int):
     # we will use 10% of machines as fallover machines.
     desired_run_size: int = int(.5*N)
 
@@ -18,6 +19,7 @@ def start_training(hosts: List[Host]):
     # We will start by running a health check on all of our machines
     # to find the 90% percentile machines and exclude the bottom 10%.
 
+    logger.info(f"starting health checks host {len(hosts)} hosts")
     pg: List[Process] = ctx.create_process_group(hosts, args=['python', '-m', 'health_check'], npp=1)
 
     health_responses: Dict[Future[Any], Process] = {p.recv(): p for p in pg}
@@ -43,7 +45,7 @@ def start_training(hosts: List[Host]):
     to_rank: List[Score, Process] = [(f.result(), health_responses.pop(f))
                                      for _, f in working_machines]
 
-    print(f"Found {to_rank} hosts that passed health checks, ranking...")
+    logger.info(f"Found {len(to_rank)} hosts that passed health checks, ranking...")
     to_rank = sorted(to_rank, key=lambda x: x[0])
 
     # TODO NEXT: if we end up with too few hosts to start,
@@ -56,10 +58,11 @@ def start_training(hosts: List[Host]):
     good, slow = to_rank[:desired_run_size], to_rank[desired_run_size:]
     good_hosts = [p.host for score, p in good]
 
-    print(f"Chose hosts: {[p.rank for _, p in good]}")
+    logger.info(f"Chose hosts: {[p.rank for _, p in good]}")
 
     # Let's get training started.
-    process_group = ctx.create_process_group(good_hosts, args=['python', '-m', 'train'], npp=1)
+    logger.info(f"Launching {npp*desired_run_size} processes")
+    process_group = ctx.create_process_group(good_hosts, args=['python', '-m', 'train'], npp=npp)
 
     # now simultaneously with training lets sort out what to do with our
     # stragglers. slow hosts are probably ok to keep, they responded
@@ -77,7 +80,7 @@ def start_training(hosts: List[Host]):
     # the remaining hosts in health_responses have either not responded
     # or are unhealthy.
     unhealthy_hosts = [proc.host for proc in health_responses.values()]
-    print(f"Replacing unhealthy hosts: {unhealthy_hosts}")
+    logger.info(f"Replacing unhealthy hosts: {unhealthy_hosts}")
     # We will ask the these hosts get replaced in the job scheduler.
     # All work scheduled on them will be aborted/cancelled.
 
@@ -95,6 +98,7 @@ def healthy(score):
 
 if __name__ == '__main__':
     N = int(sys.argv[1])
+    npp = 1
     ctx = Context()
     # Acquire some host machines to run on.
     # For today's job schedulers (Slurm/MAST), this will work by
@@ -107,12 +111,13 @@ if __name__ == '__main__':
     # externally to the worker machines and actually
     # request and wait for the hosts to get provided.
     hosts: List[Host] = ctx.request_hosts(n=N).result()
-    while True:
-        process_group, current_hosts = start_training(hosts)
-
+    complete = False
+    while not complete:
+        process_group, current_hosts = start_training(hosts, npp)
+        complete = True
         for f in as_completed([f.returncode() for f in process_group]):
             if f.exception() is not None or f.result() != 0:
-                print("Training has failed, attempting restart...")
+                logger.info("Training has failed, attempting restart...")
                 # training has failed, clean up the training processes
                 for p in process_group:
                     p.signal(signal.SIGTERM) # TODO: maybe have a broadcasting signal function.
@@ -125,4 +130,6 @@ if __name__ == '__main__':
                 # The health check could then attempt to clean up
                 # any stale processes and report unhealthy if
                 # it cannot.
+                complete = False
                 break
+    logger.info(f"Training exited successfully.")

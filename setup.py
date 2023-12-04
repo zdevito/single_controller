@@ -8,20 +8,3 @@ setup(
     author='Your Name',
     description='Single controller',
 )
-
-setup(
-    name='single_machine',
-    version='1.0',
-    packages=find_packages(),
-    install_requires=[],
-    author='Your Name',
-    description='Single Machine Single Controller',
-)
-setup(
-    name='supervisor',
-    version='1.0',
-    packages=find_packages(),
-    install_requires=[],
-    author='Your Name',
-    description='Supervisor',
-)
