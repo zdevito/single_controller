@@ -9,7 +9,7 @@ import time
 # and then relaunch the host managers if the error
 # to simulate the host manager moving to a new host
 N = 4
-supervise = subprocess.Popen([sys.executable, '-m', 'supervise', str(N)])
+supervise = subprocess.Popen(['example_train', str(N)])
 def create_host():
     return subprocess.Popen([sys.executable, '-m', 'supervisor.host', 'tcp://localhost:55555'])
 hosts = [create_host() for i in range(N)]

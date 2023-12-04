@@ -388,6 +388,7 @@ class Context:
         self._next_id = 0
         self._exits = 0
         self._launches = 0
+        self._exit_event_loop = False
 
     def _event_loop(self):
         _time_poll = 0
@@ -439,6 +440,8 @@ class Context:
                         self._requests_ready.recv()
                         fn = self._requests.popleft()
                         fn()
+            if self._exit_event_loop:
+                return
             time_end = time.time()
             _time_poll += time_poll - time_begin
             _time_process += time_end - time_poll
@@ -472,7 +475,7 @@ class Context:
         self._doorbell.send(b'')
 
     def _send_abort(self, host, with_error):
-        self._backend.send_multipart([host._name, pickle.dumps(('abort', True))])
+        self._backend.send_multipart([host._name, pickle.dumps(('abort', with_error))])
 
     def request_hosts(self, n: int) -> 'Future[List[Host]]':
         """
@@ -552,7 +555,17 @@ class Context:
             # let it get assigned to the next host to checkin
             self._request_host(h)
 
+    def _shutdown(self):
+        self._exit_event_loop = True
+        self._return_hosts(self._name_to_host.values())
 
+    def shutdown(self):
+        self._schedule(self._shutdown)
+        self._thread.join()
+        self._backend.close()
+        self._requests_ready.close()
+        self._doorbell.close()
+        self._context.term()
 
     # TODO: other arguments like environment, etc.
     def create_process_group(self, hosts: List[Host], args, npp=1, simulate=False) -> List[Process]:

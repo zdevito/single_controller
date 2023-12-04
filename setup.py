@@ -7,4 +7,9 @@ setup(
     install_requires=[],
     author='Your Name',
     description='Single controller',
+    entry_points = {
+        'console_scripts': [
+            'example_train = example_train.supervise:main'
+        ]
+    }
 )

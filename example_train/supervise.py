@@ -8,10 +8,12 @@ import subprocess
 import signal
 from supervisor import as_completed
 from contextlib import contextmanager
+import time
 
 logger = logging.getLogger(__name__)
+ctx = Context()
 
-def start_training(hosts: List[Host], npp: int):
+def start_training(N: int, hosts: List[Host], npp: int):
     # we will use 10% of machines as fallover machines.
     desired_run_size: int = int(.5*N)
 
@@ -20,7 +22,7 @@ def start_training(hosts: List[Host], npp: int):
     # to find the 90% percentile machines and exclude the bottom 10%.
 
     logger.info(f"starting health checks host {len(hosts)} hosts")
-    pg: List[Process] = ctx.create_process_group(hosts, args=['python', '-m', 'health_check'], npp=1)
+    pg: List[Process] = ctx.create_process_group(hosts, args=['python', '-m', 'example_train.healthh_check'], npp=1)
 
     health_responses: Dict[Future[Any], Process] = {p.recv(): p for p in pg}
 
@@ -62,7 +64,7 @@ def start_training(hosts: List[Host], npp: int):
 
     # Let's get training started.
     logger.info(f"Launching {npp*desired_run_size} processes")
-    process_group = ctx.create_process_group(good_hosts, args=['python', '-m', 'train'], npp=npp)
+    process_group = ctx.create_process_group(good_hosts, args=['python', '-m', 'example_train.train'], npp=npp)
 
     # now simultaneously with training lets sort out what to do with our
     # stragglers. slow hosts are probably ok to keep, they responded
@@ -96,10 +98,9 @@ def start_training(hosts: List[Host], npp: int):
 def healthy(score):
     return score.exception() is None and score.result() < 4
 
-if __name__ == '__main__':
+def main():
     N = int(sys.argv[1])
     npp = 1
-    ctx = Context()
     # Acquire some host machines to run on.
     # For today's job schedulers (Slurm/MAST), this will work by
     # having the job scheduler launch the supervisor on one host,
@@ -113,7 +114,7 @@ if __name__ == '__main__':
     hosts: List[Host] = ctx.request_hosts(n=N).result()
     complete = False
     while not complete:
-        process_group, current_hosts = start_training(hosts, npp)
+        process_group, current_hosts = start_training(N, hosts, npp)
         complete = True
         for f in as_completed([f.returncode() for f in process_group]):
             if f.exception() is not None or f.result() != 0:
@@ -133,3 +134,4 @@ if __name__ == '__main__':
                 complete = False
                 break
     logger.info(f"Training exited successfully.")
+    ctx.shutdown()
