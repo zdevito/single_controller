@@ -136,12 +136,14 @@ class Host:
 
     def run_event_loop_forever(self):
         heartbeat_at = time.time() + HEARTBEAT_INTERVAL
+        connected = False
         while True:
             for s, _ in self.poller.poll(timeout=HEARTBEAT_INTERVAL):
                 if isinstance(s, int):
                     process, returncode = self._fd_exit(s)
                     self.backend.send(pickle.dumps(('_exited', process.proc_id, returncode)))
                 elif s is self.backend:
+                    connected = True
                     cmd, *args = pickle.loads(self.backend.recv())
                     getattr(self, cmd)(*args)
                 elif s is self.proc_comm:
@@ -151,12 +153,12 @@ class Host:
                     if len(msg):
                         self.backend.send(pickle.dumps(('_response', process.proc_id, msg)))
 
-            if time.time() > heartbeat_at:
+            if connected and time.time() > heartbeat_at:
                 heartbeat_at = time.time() + HEARTBEAT_INTERVAL
-                self.backend.send(b"")
+                self.heartbeat()
 
-if __name__ == '__main__':
-    manager = Host(sys.argv[1])
+def main(addr):
+    manager = Host(addr)
     def handler(signal, frame):
         manager.shutdown()
         sys.exit(1)
@@ -166,3 +168,6 @@ if __name__ == '__main__':
         manager.run_event_loop_forever()
     finally:
         manager.shutdown()
+
+if __name__ == '__main__':
+    main(sys.argv[1])

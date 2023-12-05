@@ -11,9 +11,8 @@ from contextlib import contextmanager
 import time
 
 logger = logging.getLogger(__name__)
-ctx = Context()
 
-def start_training(N: int, hosts: List[Host], npp: int):
+def start_training(ctx, N: int, hosts: List[Host], npp: int):
     # we will use 10% of machines as fallover machines.
     desired_run_size: int = int(.5*N)
 
@@ -22,7 +21,7 @@ def start_training(N: int, hosts: List[Host], npp: int):
     # to find the 90% percentile machines and exclude the bottom 10%.
 
     logger.info(f"starting health checks host {len(hosts)} hosts")
-    pg: List[Process] = ctx.create_process_group(hosts, args=['python', '-m', 'example_train.healthh_check'], npp=1)
+    pg: List[Process] = ctx.create_process_group(hosts, args=['python', '-m', 'example_train.health_check'], npp=1)
 
     health_responses: Dict[Future[Any], Process] = {p.recv(): p for p in pg}
 
@@ -98,8 +97,8 @@ def start_training(N: int, hosts: List[Host], npp: int):
 def healthy(score):
     return score.exception() is None and score.result() < 4
 
-def main():
-    N = int(sys.argv[1])
+def main(N):
+    ctx = Context()
     npp = 1
     # Acquire some host machines to run on.
     # For today's job schedulers (Slurm/MAST), this will work by
@@ -114,7 +113,7 @@ def main():
     hosts: List[Host] = ctx.request_hosts(n=N).result()
     complete = False
     while not complete:
-        process_group, current_hosts = start_training(N, hosts, npp)
+        process_group, current_hosts = start_training(ctx, N, hosts, npp)
         complete = True
         for f in as_completed([f.returncode() for f in process_group]):
             if f.exception() is not None or f.result() != 0:
@@ -135,3 +134,7 @@ def main():
                 break
     logger.info(f"Training exited successfully.")
     ctx.shutdown()
+
+if __name__ == '__main__':
+    N = int(sys.argv[1])
+    main(N)
