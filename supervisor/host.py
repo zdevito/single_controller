@@ -55,6 +55,7 @@ class Host:
     def __init__(self, supervisor_port):
         self.context = zmq.Context(1)
         self.backend = self.context.socket(zmq.DEALER)
+        self.backend.setsockopt(zmq.IPV6, True)
         self.backend.connect(supervisor_port)
 
         # initial heartbeat to tell supervisor we exist
@@ -144,6 +145,7 @@ class Host:
                     self.backend.send(pickle.dumps(('_exited', process.proc_id, returncode)))
                 elif s is self.backend:
                     connected = True
+                    print("CONNECTED!")
                     cmd, *args = pickle.loads(self.backend.recv())
                     getattr(self, cmd)(*args)
                 elif s is self.proc_comm:

@@ -372,6 +372,7 @@ class Context:
         # to talk to other hosts
 
         self._backend = self._context.socket(zmq.ROUTER)
+        self._backend.setsockopt(zmq.IPV6, True)
         self._backend.bind('tcp://*:55555')
 
         self._poller = zmq.Poller()
@@ -463,7 +464,7 @@ class Context:
         host_histogram = {}
         for h in self._name_to_host.values():
             host_histogram[h._state] = host_histogram.setdefault(h._state, 0) + 1
-        logger.info("supervisor status: %s process launches, %s exits, %s host handles without hosts, %s connected hosts with handles, %s time spent polling, %s time spent active, hosts %s",
+        logger.info("supervisor status: %s process launches, %s exits, %s host handles without hosts, %s connected hosts without handles, %s time spent polling, %s time spent active, hosts %s",
          self._launches, self._exits, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
 
 

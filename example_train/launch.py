@@ -16,7 +16,7 @@ N = 4
 def restarting():
     supervise = subprocess.Popen([sys.executable, '-m', 'example_train.supervise', str(N)])
     def create_host():
-        return subprocess.Popen([sys.executable, '-m', 'supervisor.host', 'tcp://localhost:55555'])
+        return subprocess.Popen([sys.executable, '-m', 'supervisor.host', 'tcp://devgpu005.ncg1.facebook.com:55555'])
     hosts = [create_host() for i in range(N)]
     while True:
         if supervise.poll() is not None:
@@ -53,4 +53,5 @@ def emulate_mast_launch():
         hosts = [h for h, s in zip(hosts, status) if s is None]
         time.sleep(.1)
 
-emulate_mast_launch()
+#emulate_mast_launch()
+restarting()

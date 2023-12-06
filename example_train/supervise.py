@@ -21,7 +21,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
     # to find the 90% percentile machines and exclude the bottom 10%.
 
     logger.info(f"starting health checks host {len(hosts)} hosts")
-    pg: List[Process] = ctx.create_process_group(hosts, args=['python', '-m', 'example_train.health_check'], npp=1)
+    pg: List[Process] = ctx.create_process_group(hosts, args=[sys.executable, '-m', 'example_train.health_check'], npp=1)
 
     health_responses: Dict[Future[Any], Process] = {p.recv(): p for p in pg}
 
@@ -29,7 +29,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
     # as_completed returns messages as we receive them, avoiding waiting for stragglers.
     # if we do not hear from enough machines in 5 minutes, we assume
     # something about the cluster is unhealthy and then bail out entirely
-    TIMEOUT = 10
+    TIMEOUT = 60*100
     responding_machines = as_completed(health_responses.keys(), timeout=TIMEOUT)
 
     # some of the machines that report back might be completely unhealthy
@@ -63,7 +63,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
 
     # Let's get training started.
     logger.info(f"Launching {npp*desired_run_size} processes")
-    process_group = ctx.create_process_group(good_hosts, args=['python', '-m', 'example_train.train'], npp=npp)
+    process_group = ctx.create_process_group(good_hosts, args=[sys.executable, '-m', 'example_train.train'], npp=npp)
 
     # now simultaneously with training lets sort out what to do with our
     # stragglers. slow hosts are probably ok to keep, they responded
@@ -72,7 +72,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
     # but maybe slower.
 
     try:
-        for f in as_completed(health_responses.keys(), timeout=3):
+        for f in as_completed(health_responses.keys(), timeout=60*5):
             if healthy(f):
                 health_responses.pop(f)
     except TimeoutError:
