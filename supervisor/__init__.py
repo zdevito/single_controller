@@ -11,6 +11,8 @@ import pickle
 import logging
 import os
 import weakref
+import io
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +24,8 @@ HEARTBEAT_INTERVAL = 1.0
 class Future:
     """Represents the result of an asynchronous computation."""
     def __init__(self, context):
-        self._context = context
         """Initializes the future. Should not be called by clients."""
+        self._context = context
         self._complete = False
         self._value = None
         self._was_exception = False
@@ -66,7 +68,7 @@ class Future:
     def _wait(self, timeout):
         if self._complete:
             return True
-        for futs in self._context._generate_futures(timeout):
+        for futs in self._context._generate_futures(timeout, lambda: (self,)):
             for f, value, was_exception in futs:
                 f._set_value(value, was_exception)
             if self._complete:
@@ -170,7 +172,7 @@ def as_completed(futures, timeout=None, enumerate=False):
     if not ctx:
         return
     yield from completed
-    for futs in ctx._generate_futures(timeout):
+    for futs in ctx._generate_futures(timeout, lambda: d.keys()):
         to_yield = []
         for fut, value, was_exception in futs:
             fut._set_value(value, was_exception)
@@ -192,7 +194,7 @@ def wait(futures, timeout=None, return_when=ALL_COMPLETED, enumerate=False):
         return [], []
     if return_when(completed, completed_exception, d):
         return completed, list(d.values())
-    for futs in ctx._generate_futures(timeout):
+    for futs in ctx._generate_futures(timeout, lambda: d.keys()):
         for fut, value, was_exception in futs:
             fut._set_value(value, was_exception)
             v = d.pop(fut, None)
@@ -308,6 +310,7 @@ class Process:
 
     def _send(self, msg: Any):
         if self._state != 'aborted':
+            self._context._sends += 1
             self.host._send(pickle.dumps(('send', self._id, msg)))
 
     def signal(self, signal=signal.SIGTERM, group=True):
@@ -338,6 +341,7 @@ class Process:
     # message that can be sent
 
     def _response(self, msg):
+        self._context._responses += 1
         msg = pickle.loads(msg)
         for i, (filt, fut) in enumerate(self._recvs):
             if filt(msg):
@@ -356,7 +360,7 @@ class Process:
         self._pid.set_result(pid)
 
 class Context:
-    def __init__(self):
+    def __init__(self, port=55555):
         self._context = zmq.Context(1)
 
         # to talk to python clients in this process
@@ -373,7 +377,7 @@ class Context:
 
         self._backend = self._context.socket(zmq.ROUTER)
         self._backend.setsockopt(zmq.IPV6, True)
-        self._backend.bind('tcp://*:55555')
+        self._backend.bind(f'tcp://*:{port}')
 
         self._poller = zmq.Poller()
         self._poller.register(self._backend, zmq.POLLIN)
@@ -388,6 +392,8 @@ class Context:
         self._thread.start()
         self._next_id = 0
         self._exits = 0
+        self._sends = 0
+        self._responses = 0
         self._launches = 0
         self._exit_event_loop = False
 
@@ -398,9 +404,6 @@ class Context:
             time_begin = time.time()
             poll_result = self._poller.poll(timeout=HEARTBEAT_INTERVAL*1000*2)
             time_poll = time.time()
-            if self._finished_futures[-1]:
-                self._finished_futures.append([])
-                self._requests_ready.send(b'')
             for sock, _ in poll_result:
                 if sock is self._backend:
                     f, msg = self._backend.recv_multipart()
@@ -443,11 +446,9 @@ class Context:
                         fn()
             if self._exit_event_loop:
                 return
-            time_end = time.time()
-            _time_poll += time_poll - time_begin
-            _time_process += time_end - time_poll
             t = time.time()
-            if t - self._last_heartbeat_check > HEARTBEAT_INTERVAL*2:
+            should_check_heartbeat = t - self._last_heartbeat_check > HEARTBEAT_INTERVAL*2
+            if should_check_heartbeat:
                 elapsed = t - self._last_heartbeat_check
                 self._last_heartbeat_check = t
                 # priority queue would be log(N)
@@ -456,16 +457,29 @@ class Context:
                         # host timeout
                         logger.warning("Host %s has not heartbeated in %s seconds, disconnecting it", host._name, elapsed)
                         host._disconnect()
+
+            # Marking futures ready should always happen at the end of processing events above
+            # to unblock anything processing the futures, before we start waiting for more events.
+            if self._finished_futures[-1]:
+                self._finished_futures.append([])
+                self._requests_ready.send(b'')
+
+            time_end = time.time()
+            _time_poll += time_poll - time_begin
+            _time_process += time_end - time_poll
+
+            if should_check_heartbeat:
                 self.logstatus(_time_poll / elapsed, _time_process / elapsed)
                 _time_poll = 0
                 _time_process = 0
+
 
     def logstatus(self, poll_fraction, active_fraction):
         host_histogram = {}
         for h in self._name_to_host.values():
             host_histogram[h._state] = host_histogram.setdefault(h._state, 0) + 1
-        logger.info("supervisor status: %s process launches, %s exits, %s host handles without hosts, %s connected hosts without handles, %s time spent polling, %s time spent active, hosts %s",
-         self._launches, self._exits, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
+        logger.info("supervisor status: %s process launches, %s exits, %s message sends, %s message responses, %s host handles without hosts, %s connected hosts without handles, %s time spent polling, %s time spent active, hosts %s",
+         self._launches, self._exits, self._sends, self._responses, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
 
 
     def _debug_dict(self):
@@ -579,7 +593,7 @@ class Context:
         for p in procs:
             p.host._launch(p)
 
-    def _generate_futures(self, timeout=None) -> 'Generator[List[Future]]':
+    def _generate_futures(self, timeout, remaining_futures_cb, ttl_report_interval=5) -> 'Generator[List[Future]]':
         if timeout is None:
             while True:
                 self._doorbell.recv()
@@ -592,9 +606,13 @@ class Context:
             t = time.time()
             expiry = t + timeout
             while t < expiry:
-                if self._doorbell_poller.poll(expiry - t):
+                if self._doorbell_poller.poll(timeout=1000*min(ttl_report_interval, expiry - t)):
                     self._doorbell.recv()
                     yield self._finished_futures.popleft()
+                elif ttl_report_interval < expiry - t:
+                    s = io.StringIO()
+                    traceback.print_stack(file=s)
+                    logger.info(f"Waiting for {len(remaining_futures_cb())} futures, {expiry - t} seconds before timeout:\n{s.getvalue()}")
                 t = time.time()
 
 

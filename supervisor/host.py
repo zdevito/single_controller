@@ -8,6 +8,9 @@ from typing import NamedTuple, Any
 import ctypes
 from supervisor import HEARTBEAT_INTERVAL
 import signal
+import logging
+
+logger = logging.getLogger()
 ABORT_INTERVAL = 5
 __NR_pidfd_open = 434
 libc = ctypes.CDLL(None)
@@ -128,6 +131,7 @@ class Host:
             for proc in self.process_table.values():
                 os.killpg(proc.subprocess.pid, signal.SIGKILL)
 
+
     def abort(self, with_error):
         self.shutdown()
         if with_error:
@@ -144,8 +148,9 @@ class Host:
                     process, returncode = self._fd_exit(s)
                     self.backend.send(pickle.dumps(('_exited', process.proc_id, returncode)))
                 elif s is self.backend:
+                    if not connected:
+                        logging.info(f"Connected to supervisor")
                     connected = True
-                    print("CONNECTED!")
                     cmd, *args = pickle.loads(self.backend.recv())
                     getattr(self, cmd)(*args)
                 elif s is self.proc_comm:
@@ -160,6 +165,7 @@ class Host:
                 self.heartbeat()
 
 def main(addr):
+    logging.basicConfig(format='%(asctime)s %(levelname)s:%(name)s:%(message)s', level=logging.INFO)
     manager = Host(addr)
     def handler(signal, frame):
         manager.shutdown()

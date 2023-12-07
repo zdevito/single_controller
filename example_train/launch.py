@@ -4,7 +4,7 @@ import signal
 from contextlib import contextmanager
 import time
 import os
-
+import socket
 # this script simulates what a job scheduler might do.
 # it will launch our host managers, and supervisor
 # and then relaunch the host managers if the error
@@ -37,8 +37,9 @@ def emulate_mast_launch():
     def create_host(i):
         env = {**os.environ}
         env['TW_TASK_ID'] = str(i)
-        env['MAST_HPC_TASK_GROUP_HOSTNAMES'] = 'localhost'
+        env['MAST_HPC_TASK_GROUP_HOSTNAMES'] = 'devgpu005.ncg1'
         env['MAST_HPC_TASK_GROUP_SIZE'] = str(N)
+        env['LAUNCH_FAKE'] = '1'
         return subprocess.Popen([sys.executable,  '-m', 'example_train.mast'], env=env)
     hosts = [create_host(i) for i in range(N)]
     while hosts:
@@ -53,5 +54,5 @@ def emulate_mast_launch():
         hosts = [h for h, s in zip(hosts, status) if s is None]
         time.sleep(.1)
 
-#emulate_mast_launch()
-restarting()
+emulate_mast_launch()
+#restarting()

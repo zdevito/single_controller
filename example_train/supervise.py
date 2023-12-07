@@ -12,9 +12,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
-def start_training(ctx, N: int, hosts: List[Host], npp: int):
+
+def start_training(ctx, N: int, hosts: List[Host], npp: int, run_fraction=.5, rank_fraction=.75):
     # we will use 10% of machines as fallover machines.
-    desired_run_size: int = int(.5*N)
+    desired_run_size: int = int(run_fraction*N)
 
     # The supervisor can now create processes on hosts.
     # We will start by running a health check on all of our machines
@@ -29,7 +30,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
     # as_completed returns messages as we receive them, avoiding waiting for stragglers.
     # if we do not hear from enough machines in 5 minutes, we assume
     # something about the cluster is unhealthy and then bail out entirely
-    TIMEOUT = 60*100
+    TIMEOUT = 60*5
     responding_machines = as_completed(health_responses.keys(), timeout=TIMEOUT)
 
     # some of the machines that report back might be completely unhealthy
@@ -40,7 +41,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
     # some might have major health check issues that will cause them to hang
     # for awhile, let's only sort the first 99% of machines by using zip
     # to stop iteration after to_sort machines have been received
-    to_sort = int(.75 * N)
+    to_sort = int(rank_fraction * N)
     working_machines = zip(range(to_sort), working_machines)
 
     to_rank: List[Score, Process] = [(f.result(), health_responses.pop(f))
@@ -70,6 +71,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
     # and are healthy. There is 1% of hosts we didn't wait for to cut tail latency.
     # Let's see if any have checked in anyway and should be considered healthy
     # but maybe slower.
+    return process_group, good_hosts
 
     try:
         for f in as_completed(health_responses.keys(), timeout=60*5):
@@ -80,7 +82,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
 
     # the remaining hosts in health_responses have either not responded
     # or are unhealthy.
-    unhealthy_hosts = [proc.host for proc in health_responses.values()]
+    # unhealthy_hosts = [proc.host for proc in health_responses.values()]
     logger.info(f"Replacing unhealthy hosts: {unhealthy_hosts}")
     # We will ask the these hosts get replaced in the job scheduler.
     # All work scheduled on them will be aborted/cancelled.
@@ -97,9 +99,11 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int):
 def healthy(score):
     return score.exception() is None and score.result() < 4
 
-def main(N):
-    ctx = Context()
-    npp = 1
+
+def train_with_size(ctx, hosts):
+    npp = 8
+    N = len(hosts)
+    logger.info(f"Starting training with {N} hosts, {npp} processes per host.")
     # Acquire some host machines to run on.
     # For today's job schedulers (Slurm/MAST), this will work by
     # having the job scheduler launch the supervisor on one host,
@@ -110,10 +114,10 @@ def main(N):
     # In the future, the supervisor can run
     # externally to the worker machines and actually
     # request and wait for the hosts to get provided.
-    hosts: List[Host] = ctx.request_hosts(n=N).result()
     complete = False
     while not complete:
-        process_group, current_hosts = start_training(ctx, N, hosts, npp)
+        process_group, current_hosts = start_training(ctx, N, hosts, npp, run_fraction=1.0, rank_fraction=1.0)
+        logger.info(f"Process group size {len(process_group)}")
         complete = True
         for f in as_completed([f.returncode() for f in process_group]):
             if f.exception() is not None or f.result() != 0:
@@ -133,8 +137,23 @@ def main(N):
                 complete = False
                 break
     logger.info(f"Training exited successfully.")
+
+def main(N, port):
+    ctx = Context(port=port)
+    hosts: List[Host] = ctx.request_hosts(n=N).result()
+
+    # if we don't warmup, then we can get started before all of our
+    # other hosts have checked in.
+    logger.info(f"Beginning warmup")
+    train_with_size(ctx, hosts)
+    logger.info(f"Warmup finished.")
+
+    to_train = 1
+    while to_train <= N:
+        train_with_size(ctx, hosts[:to_train])
+        to_train *= 2
     ctx.shutdown()
 
 if __name__ == '__main__':
     N = int(sys.argv[1])
-    main(N)
+    main(N, 55555)
