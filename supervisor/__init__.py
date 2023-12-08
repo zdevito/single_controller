@@ -79,6 +79,7 @@ class Future:
                 callback(self)
             except Exception:
                 logger.exception('exception calling callback for %r', self)
+        self._done_callbacks.clear()
 
     def result(self, timeout=None):
         """Return the result of the call that the future represents.
@@ -136,7 +137,7 @@ class Future:
         self._complete = True
         self._value = value
         self._was_exception = was_exception
-        self._invoke_callbacks()
+        return self._invoke_callbacks
 
     # called from context event loop
 
@@ -587,8 +588,12 @@ class Context:
         def read_futures():
             self._doorbell.recv()
             futs = self._finished_futures.popleft()
-            for f, value, was_exception in futs:
-                f._set_value(value, was_exception)
+            # All `futs` need to be marked complete before
+            # we run any callbacks, because a callback may recursively wait
+            # on a future in futs, and re-entering _process_futures won't unblock it.
+            callbacks = [f._set_value(value, was_exception) for f, value, was_exception in futs]
+            for c in callbacks:
+                c()
             return len(futs)
 
         t = time.time()
