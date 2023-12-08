@@ -13,7 +13,7 @@ import os
 import weakref
 import io
 import traceback
-
+from typing import NamedTuple
 logger = logging.getLogger(__name__)
 
 
@@ -68,9 +68,7 @@ class Future:
     def _wait(self, timeout):
         if self._complete:
             return True
-        for futs in self._context._generate_futures(timeout, lambda: (self,)):
-            for f, value, was_exception in futs:
-                f._set_value(value, was_exception)
+        for _ in self._context._process_futures(timeout, lambda: 1):
             if self._complete:
                 return True
         return False
@@ -150,60 +148,44 @@ class Future:
 
     __class_getitem__ = classmethod(types.GenericAlias)
 
-_enumerate = enumerate
-
-def _create_dict(futures, enumerate):
-    context = None
-    completed = []
-    completed_exception = False
-    d = {}
-    for i, f in _enumerate(futures):
-        v = (i, f) if enumerate else f
-        context = f._context
-        if f.done():
-            completed.append(v)
-            completed_exception |= f._was_exception
-        else:
-            d[f] = v
-    return context, completed, completed_exception, d
-
 def as_completed(futures, timeout=None, enumerate=False):
-    ctx, completed, _, d = _create_dict(futures, enumerate)
+    worklist = deque()
+    worklist_append = worklist.append
+    ctx = None
+    for fut in futures:
+        ctx = fut._context
+        if fut._complete:
+            worklist_append(fut)
+        else:
+            fut._done_callbacks.append(worklist_append)
     if not ctx:
         return
-    yield from completed
-    for futs in ctx._generate_futures(timeout, lambda: d.keys()):
-        to_yield = []
-        for fut, value, was_exception in futs:
-            fut._set_value(value, was_exception)
-            v = d.pop(fut, None)
-            if v is not None:
-                to_yield.append(v)
-        yield from to_yield
-        if not d:
+    remaining = len(futures)
+    for _ in ctx._process_futures(timeout, lambda: remaining):
+        while worklist:
+            remaining -= 1
+            yield worklist.popleft()
+        if remaining == 0:
             return
     raise TimeoutError()
 
-FIRST_COMPLETED = lambda completed, completed_exception, d: completed
-FIRST_EXCEPTION = lambda completed, completed_exception, d: completed_exception
-ALL_COMPLETED = lambda completed, completed_exception, d: not d
+FIRST_COMPLETED = lambda fut: True
+FIRST_EXCEPTION = lambda fut: fut._was_exception
+ALL_COMPLETED = lambda fut: False
 
-def wait(futures, timeout=None, return_when=ALL_COMPLETED, enumerate=False):
-    ctx, completed, completed_exception, d = _create_dict(futures, enumerate)
-    if not ctx:
-        return [], []
-    if return_when(completed, completed_exception, d):
-        return completed, list(d.values())
-    for futs in ctx._generate_futures(timeout, lambda: d.keys()):
-        for fut, value, was_exception in futs:
-            fut._set_value(value, was_exception)
-            v = d.pop(fut, None)
-            if v is not None:
-                completed.append(v)
-                completed_exception |= was_exception
-        if return_when(completed, completed_exception, d):
-            return completed, list(d.values())
-    raise TimeoutError()
+class _WaitResult(NamedTuple):
+    done: set
+    not_done: set
+
+def wait(futures, timeout=None, return_when=ALL_COMPLETED):
+    done = set()
+    not_done = set(futures)
+    for fut in as_completed(futures, timeout):
+        not_done.remove(fut)
+        done.add(fut)
+        if return_when(fut):
+            break
+    return _WaitResult(done, not_done)
 
 def debug_dict(o):
     if hasattr(o, '_debug_dict'):
@@ -359,6 +341,9 @@ class Process:
         self._state = 'running'
         self._pid.set_result(pid)
 
+    def __del__(self):
+        self._context._proc_deletes += 1
+
 class Context:
     def __init__(self, port=55555):
         self._context = zmq.Context(1)
@@ -395,6 +380,7 @@ class Context:
         self._sends = 0
         self._responses = 0
         self._launches = 0
+        self._proc_deletes = 0
         self._exit_event_loop = False
 
     def _event_loop(self):
@@ -478,8 +464,8 @@ class Context:
         host_histogram = {}
         for h in self._name_to_host.values():
             host_histogram[h._state] = host_histogram.setdefault(h._state, 0) + 1
-        logger.info("supervisor status: %s process launches, %s exits, %s message sends, %s message responses, %s host handles without hosts, %s connected hosts without handles, %s time spent polling, %s time spent active, hosts %s",
-         self._launches, self._exits, self._sends, self._responses, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
+        logger.info("supervisor status: %s process launches, %s exits, %s message sends, %s message responses, %s process __del__, %s host handles without hosts, %s connected hosts without handles, %s time spent polling, %s time spent active, hosts %s",
+         self._launches, self._exits, self._sends, self._responses, self._proc_deletes, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
 
 
     def _debug_dict(self):
@@ -593,27 +579,39 @@ class Context:
         for p in procs:
             p.host._launch(p)
 
-    def _generate_futures(self, timeout, remaining_futures_cb, ttl_report_interval=5) -> 'Generator[List[Future]]':
+    def _process_futures(self, timeout, remaining_futures_cb, ttl_report_interval=5) -> 'Generator[int]':
+        """
+        Return a generator that completes futures. Yields the number of futures it has
+        processed in each step, and will stop iterating when timeout is reached.
+        """
+        def read_futures():
+            self._doorbell.recv()
+            futs = self._finished_futures.popleft()
+            for f, value, was_exception in futs:
+                f._set_value(value, was_exception)
+            return len(futs)
+
+        t = time.time()
+        # by always yielding right after starting the timer
+        # we allow the already-done futures to be returned
+        # from the caller while still tracking total time
+        # allowed to be waiting here
+        yield 0
         if timeout is None:
             while True:
-                self._doorbell.recv()
-                yield self._finished_futures.popleft()
-        elif timeout == 0:
-            while self._doorbell_poller.poll(0):
-                self._doorbell.recv()
-                yield self._finished_futures.popleft()
+                yield read_futures()
         else:
-            t = time.time()
             expiry = t + timeout
             while t < expiry:
                 if self._doorbell_poller.poll(timeout=1000*min(ttl_report_interval, expiry - t)):
-                    self._doorbell.recv()
-                    yield self._finished_futures.popleft()
+                    yield read_futures()
                 elif ttl_report_interval < expiry - t:
                     s = io.StringIO()
                     traceback.print_stack(file=s)
-                    logger.info(f"Waiting for {len(remaining_futures_cb())} futures, {expiry - t} seconds before timeout:\n{s.getvalue()}")
+                    logger.info(f"Waiting for {remaining_futures_cb()} futures, {expiry - t} seconds before timeout:\n{s.getvalue()}")
                 t = time.time()
+            while self._doorbell_poller.poll(0):
+                yield read_futures()
 
 
 def get_message_queue():

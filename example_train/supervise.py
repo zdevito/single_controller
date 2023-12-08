@@ -116,7 +116,7 @@ def train_with_size(ctx, hosts):
     # request and wait for the hosts to get provided.
     complete = False
     while not complete:
-        process_group, current_hosts = start_training(ctx, N, hosts, npp, run_fraction=1.0, rank_fraction=1.0)
+        process_group, current_hosts = start_training(ctx, N, hosts, npp, run_fraction=1, rank_fraction=1)
         logger.info(f"Process group size {len(process_group)}")
         complete = True
         for f in as_completed([f.returncode() for f in process_group]):
