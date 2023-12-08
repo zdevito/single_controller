@@ -3,7 +3,20 @@ Getting Started With Examples
 
 Install the package:
 
-    python setup.py develop
+    pip install -e .
+
+For supervisor
+--------------
+
+Run the example_train application, which simulates training.
+There is some stuff commented out which can be enabled to inject failures.
+
+    python example_train/launch.py
+
+The other files in the folder are the different parts of the job (health_check, train, supervisor script).
+
+For single_controller tensors
+-----------------------------
 
 Run the tests (kinda noisy at this point)
 

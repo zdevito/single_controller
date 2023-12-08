@@ -37,7 +37,7 @@ def emulate_mast_launch():
     def create_host(i):
         env = {**os.environ}
         env['TW_TASK_ID'] = str(i)
-        env['MAST_HPC_TASK_GROUP_HOSTNAMES'] = 'devgpu005.ncg1'
+        env['MAST_HPC_TASK_GROUP_HOSTNAMES'] = 'localhost'
         env['MAST_HPC_TASK_GROUP_SIZE'] = str(N)
         env['LAUNCH_FAKE'] = '1'
         return subprocess.Popen([sys.executable,  '-m', 'example_train.mast'], env=env)

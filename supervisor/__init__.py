@@ -149,26 +149,42 @@ class Future:
 
     __class_getitem__ = classmethod(types.GenericAlias)
 
-def as_completed(futures, timeout=None, enumerate=False):
-    worklist = deque()
-    worklist_append = worklist.append
-    ctx = None
-    for fut in futures:
-        ctx = fut._context
+class as_completed:
+    def __init__(self, futures=(), timeout=None):
+        self._timeout = timeout
+        self._not_done = set()
+        self._worklist = deque()
+        self._ctx = None
+        self.update(futures)
+
+    def add(self, fut):
+        self._not_done.add(fut)
+        self._ctx = fut._context
+        append = self._worklist.append
         if fut._complete:
-            worklist_append(fut)
+            append(fut)
         else:
-            fut._done_callbacks.append(worklist_append)
-    if not ctx:
-        return
-    remaining = len(futures)
-    for _ in ctx._process_futures(timeout, lambda: remaining):
-        while worklist:
-            remaining -= 1
-            yield worklist.popleft()
-        if remaining == 0:
+            fut._done_callbacks.append(append)
+
+    def update(self, futures):
+        for f in futures:
+            self.add(f)
+
+
+    def __iter__(self):
+        ctx = self._ctx
+        if not ctx:
             return
-    raise TimeoutError()
+        not_done = self._not_done
+        worklist = self._worklist
+        for _ in ctx._process_futures(self._timeout, lambda: len(not_done)):
+            while worklist:
+                f = worklist.popleft()
+                not_done.remove(f)
+                yield f
+            if not not_done:
+                return
+        raise TimeoutError()
 
 FIRST_COMPLETED = lambda fut: True
 FIRST_EXCEPTION = lambda fut: fut._was_exception
@@ -179,14 +195,13 @@ class _WaitResult(NamedTuple):
     not_done: set
 
 def wait(futures, timeout=None, return_when=ALL_COMPLETED):
+    gen = as_completed(not_done, timeout)
     done = set()
-    not_done = set(futures)
-    for fut in as_completed(futures, timeout):
-        not_done.remove(fut)
+    for fut in gen:
         done.add(fut)
         if return_when(fut):
             break
-    return _WaitResult(done, not_done)
+    return _WaitResult(done, gen._not_done)
 
 def debug_dict(o):
     if hasattr(o, '_debug_dict'):
