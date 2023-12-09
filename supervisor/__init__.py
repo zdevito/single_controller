@@ -218,6 +218,15 @@ class Host:
         self._deferred_sends = []
         self._proc_table = weakref.WeakValueDictionary()
         self._on_connection_lost = Future(context)
+        self._tcphostname = Future(context)
+
+    def hostname(self):
+        return self._tcphostname
+
+    def _hostname(self, hostname):
+        self._tcphostname.set_result(hostname)
+        # let the host know we have received its connection
+        self._send(b'')
 
     def _heartbeat(self):
         self.expiry = time.time() + HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
@@ -388,9 +397,6 @@ class Context:
         self._unassigned_connections = deque()
         self._name_to_host = {}
         self._last_heartbeat_check = time.time()
-
-        self._thread = Thread(target=self._event_loop, daemon=True)
-        self._thread.start()
         self._next_id = 0
         self._exits = 0
         self._sends = 0
@@ -398,6 +404,9 @@ class Context:
         self._launches = 0
         self._proc_deletes = 0
         self._exit_event_loop = False
+
+        self._thread = Thread(target=self._event_loop, daemon=True)
+        self._thread.start()
 
     def _event_loop(self):
         _time_poll = 0
@@ -428,18 +437,21 @@ class Context:
                         # so we are going to tell it to abort so that it gets
                         # restarted and can become a new connection.
                         logger.info("Host %s that was lost reconnected, sending abort", host._name)
-                        self._send_abort(host, True)
+                        self._send_abort(host, 'Supervisor thought host timed out')
                     elif len(msg):
                         cmd, proc_id, *args = pickle.loads(msg)
-                        proc = host._proc_table.get(proc_id)
-                        if proc is None:
+                        receiver = host if proc_id is None else host._proc_table.get(proc_id)
+                        if receiver is None:
                             # messages from a process might arrive after the user
                             # no longer has a handle to the Process object
                             # in which case they are ok to just drop
                             assert proc_id >= 0 and proc_id < self._next_id, "unexpected proc_id"
                             logger.debug("Received message %s from process %s after local handle deleted", cmd, proc_id)
                         else:
-                            getattr(proc, cmd)(*args)
+                            getattr(receiver, cmd)(*args)
+                    else:
+                        # heartbeat, respond with our own
+                        host._send(b'')
 
                 elif sock is self._requests_ready:
                     while self._requests:
@@ -480,7 +492,7 @@ class Context:
         host_histogram = {}
         for h in self._name_to_host.values():
             host_histogram[h._state] = host_histogram.setdefault(h._state, 0) + 1
-        logger.info("supervisor status: %s process launches, %s exits, %s message sends, %s message responses, %s process __del__, %s host handles without hosts, %s connected hosts without handles, %s time spent polling, %s time spent active, hosts %s",
+        logger.info("supervisor status: %s process launches, %s exits, %s message sends, %s message responses, %s process __del__, %s host handles without hosts, %s connected hosts without handles, time is %.2f%% polling and %.2f%% active, hosts %s",
          self._launches, self._exits, self._sends, self._responses, self._proc_deletes, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
 
 
@@ -543,7 +555,7 @@ class Context:
             # XXX: this fails to return a host if it was
             # not connected when it was returned.
             if h._state == 'connected':
-                self._send_abort(h, False)
+                self._send_abort(h, None)
                 h._disconnect()
 
     def replace_hosts(self, hosts: List[Host]):
@@ -562,7 +574,7 @@ class Context:
     def _replace_hosts(self, hosts):
         for h in hosts:
             if h._state == 'connected':
-                self._send_abort(h, True)
+                self._send_abort(h, 'Supervisor replaced host')
                 h._disconnect()
             # detach this host object from current name
             old = Host(self)

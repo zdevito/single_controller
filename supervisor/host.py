@@ -9,9 +9,12 @@ import ctypes
 from supervisor import HEARTBEAT_INTERVAL
 import signal
 import logging
+import socket
 
 logger = logging.getLogger()
 ABORT_INTERVAL = 5
+HEARTBEAT_LIVENESS = 3     # 3..5 is reasonable
+HEARTBEAT_INTERVAL = 1.0
 __NR_pidfd_open = 434
 libc = ctypes.CDLL(None)
 syscall = libc.syscall
@@ -61,8 +64,9 @@ class Host:
         self.backend.setsockopt(zmq.IPV6, True)
         self.backend.connect(supervisor_port)
 
-        # initial heartbeat to tell supervisor we exist
-        self.heartbeat()
+        # tell the supervisor we exist, and provide
+        # hostname for debugging.
+        self.backend.send(pickle.dumps(('_hostname', None, socket.gethostname())))
 
         self.poller = zmq.Poller()
         self.poller.register(self.backend, zmq.POLLIN)
@@ -123,7 +127,7 @@ class Host:
         expiry = time.time() + ABORT_INTERVAL
         ttl = ABORT_INTERVAL
         while ttl > 0 and self.process_table:
-            for s, _ in self.poller.poll(timeout=ttl):
+            for s, _ in self.poller.poll(timeout=1000*ttl):
                 if isinstance(s, int):
                     self._fd_exit(s)
             ttl = time.time() - expiry
@@ -132,27 +136,29 @@ class Host:
                 os.killpg(proc.subprocess.pid, signal.SIGKILL)
 
 
-    def abort(self, with_error):
+    def abort(self, with_error=None):
         self.shutdown()
         if with_error:
-            raise ConnectionAbortedError("Supervisor aborted host")
+            raise ConnectionAbortedError(with_error)
         else:
             sys.exit(0)
 
     def run_event_loop_forever(self):
         heartbeat_at = time.time() + HEARTBEAT_INTERVAL
-        connected = False
+        expiry = None
         while True:
-            for s, _ in self.poller.poll(timeout=HEARTBEAT_INTERVAL):
+            for s, _ in self.poller.poll(timeout=1000*HEARTBEAT_INTERVAL):
                 if isinstance(s, int):
                     process, returncode = self._fd_exit(s)
                     self.backend.send(pickle.dumps(('_exited', process.proc_id, returncode)))
                 elif s is self.backend:
-                    if not connected:
+                    if expiry is None:
                         logging.info(f"Connected to supervisor")
-                    connected = True
-                    cmd, *args = pickle.loads(self.backend.recv())
-                    getattr(self, cmd)(*args)
+                    expiry = time.time() + HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
+                    msg = self.backend.recv()
+                    if msg:
+                        cmd, *args = pickle.loads(msg)
+                        getattr(self, cmd)(*args)
                 elif s is self.proc_comm:
                     proc_id_bytes, msg = self.proc_comm.recv_multipart()
                     process = self.process_table[proc_id_bytes]
@@ -160,9 +166,15 @@ class Host:
                     if len(msg):
                         self.backend.send(pickle.dumps(('_response', process.proc_id, msg)))
 
-            if connected and time.time() > heartbeat_at:
-                heartbeat_at = time.time() + HEARTBEAT_INTERVAL
-                self.heartbeat()
+            if expiry is not None:
+                t = time.time()
+                if t > heartbeat_at:
+                    heartbeat_at = time.time() + HEARTBEAT_INTERVAL
+                    self.heartbeat()
+                if t > expiry:
+                    self.abort(f"No messages from supervisor for {HEARTBEAT_INTERVAL*HEARTBEAT_LIVENESS} seconds, aborting.")
+
+
 
 def main(addr):
     logging.basicConfig(format='%(asctime)s %(levelname)s:%(name)s:%(message)s', level=logging.INFO)
