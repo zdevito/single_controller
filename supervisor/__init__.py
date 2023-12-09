@@ -23,13 +23,27 @@ HEARTBEAT_INTERVAL = 1.0
 
 class Future:
     """Represents the result of an asynchronous computation."""
-    def __init__(self, context):
+    def __init__(self, context, name, hostname_future):
         """Initializes the future. Should not be called by clients."""
         self._context = context
         self._complete = False
         self._value = None
         self._was_exception = False
         self._done_callbacks = []
+        self._name = name
+        self._hostname_future = hostname_future
+
+    def __repr__(self):
+        status = 'exception' if self._was_exception else 'complete' if self._complete else 'incomplete'
+        hostname = self._hostname_future
+        if hostname is None:
+            return 'Future[{status}, {self._name}]'
+
+        if hostname.done() and hostname.exception() is None:
+            hostname = repr(hostname.result())
+        else:
+            hostname = 'unconnected'
+        return f"Future[{status}, hosts[{hostname}].{self._name}]"
 
     def done(self):
         # wait 0 just polls to see if the done message
@@ -68,7 +82,7 @@ class Future:
     def _wait(self, timeout):
         if self._complete:
             return True
-        for _ in self._context._process_futures(timeout, lambda: 1):
+        for _ in self._context._process_futures(timeout, lambda: (self,)):
             if self._complete:
                 return True
         return False
@@ -177,7 +191,7 @@ class as_completed:
             return
         not_done = self._not_done
         worklist = self._worklist
-        for _ in ctx._process_futures(self._timeout, lambda: len(not_done)):
+        for _ in ctx._process_futures(self._timeout, lambda: not_done):
             while worklist:
                 f = worklist.popleft()
                 not_done.remove(f)
@@ -217,8 +231,8 @@ class Host:
         self._state = 'unconnected'
         self._deferred_sends = []
         self._proc_table = weakref.WeakValueDictionary()
-        self._on_connection_lost = Future(context)
-        self._tcphostname = Future(context)
+        self._tcphostname = Future(context, 'hostname', None)
+        self._on_connection_lost = Future(context, 'host_connection_lost', self._tcphostname)
 
     def hostname(self):
         return self._tcphostname
@@ -277,7 +291,7 @@ class Host:
 
 class Process:
     def __init__(self, context, host, rank, world_size, args, simulate):
-        self._id = context._next_id
+        _id = self._id = context._next_id
         context._next_id += 1
         self._context = context
         self.host = host
@@ -285,8 +299,12 @@ class Process:
         self.args = args
         self.simulate = simulate
         self.world_size = world_size
-        self._pid = Future(context)
-        self._returncode = Future(context)
+        hostname = self.host.hostname()
+        # self._pid = Future(context, lambda: f'hosts[{repr(_future_value_or_none(hostname))}].process_{_id}.pid()')
+        # self._returncode = Future(context, lambda: f'hosts[{repr(_future_value_or_none(hostname))}].process_{_id}.returncode()')
+        self._pid = Future(context, f'process_{_id}.pid()', hostname)
+        self._returncode = Future(context, f'process_{_id}.returncode()', hostname)
+
         self._recvs = []
         self._messages = []
         self._state = 'launched'
@@ -329,7 +347,9 @@ class Process:
 
     # return first response where filter(msg) is True
     def recv(self, filter: callable=lambda x: True) -> 'Future[Any]':
-        fut = Future(self._context)
+        _id = self._id
+        hostname = self.host.hostname()
+        fut = Future(self._context, f'process_{_id}.recv()', hostname)
         self._context._schedule(lambda: self._recv(fut, filter))
         return fut
 
@@ -516,7 +536,7 @@ class Context:
         will immediately full the future because the reservation was
         already made.
         """
-        f = Future(self)
+        f = Future(self, 'request_hosts', None)
         hosts = tuple(Host(self) for i in range(n))
         f.set_result(hosts)
         self._schedule(lambda: self._request_hosts(hosts))
