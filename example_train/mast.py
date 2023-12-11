@@ -4,6 +4,7 @@ import sys
 import socket
 import logging
 logger = logging.getLogger()
+logging.basicConfig(format='%(asctime)s %(levelname)s:%(name)s:%(message)s', level=logging.INFO)
 N = int(os.environ['MAST_HPC_TASK_GROUP_SIZE'])
 hostname_0 = sorted(os.environ['MAST_HPC_TASK_GROUP_HOSTNAMES'].split(','))[0]
 port = 55555
@@ -15,8 +16,7 @@ else:
     zero = hostname_0 in my_host_name
     addr = f'tcp://{hostname_0}.facebook.com:{port}'
 
-logger.warn("HOSTNAME %s %s", my_host_name, zero)
-
+logger.info("hostname %s, supervisor=%s", my_host_name, zero)
 if zero:
     host_process = subprocess.Popen([sys.executable, '-m', 'supervisor.host', addr])
     from .supervise import main
