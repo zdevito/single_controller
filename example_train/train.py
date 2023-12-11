@@ -5,7 +5,6 @@ import time
 import signal
 
 rank = int(os.environ['RANK'])
-
 # for i in range(100):
 #     if rank == 0:
 #         print(f"iteration {i}")

@@ -16,7 +16,7 @@ else:
     zero = hostname_0 in my_host_name
     addr = f'tcp://{hostname_0}.facebook.com:{port}'
 
-logger.info("hostname %s, supervisor=%s", my_host_name, zero)
+logger.info("hostname %s, supervisor host is %s, supervisor=%s", my_host_name, hostname_0, zero)
 if zero:
     host_process = subprocess.Popen([sys.executable, '-m', 'supervisor.host', addr])
     from .supervise import main

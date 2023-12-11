@@ -22,7 +22,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int, run_fraction=.5, ra
     # to find the 90% percentile machines and exclude the bottom 10%.
 
     logger.info(f"starting health checks host {len(hosts)} hosts")
-    pg: List[Process] = ctx.create_process_group(hosts, args=[sys.executable, '-m', 'example_train.health_check'], npp=1)
+    pg: List[Process] = ctx.create_process_group(hosts, args=[sys.executable, '-m', 'example_train.health_check'], npp=1, name='health_check')
 
     health_responses: Dict[Future[Any], Process] = {p.recv(): p for p in pg}
 
@@ -64,7 +64,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int, run_fraction=.5, ra
 
     # Let's get training started.
     logger.info(f"Launching {npp*desired_run_size} processes")
-    process_group = ctx.create_process_group(good_hosts, args=[sys.executable, '-m', 'example_train.train'], npp=npp)
+    process_group = ctx.create_process_group(good_hosts, args=[sys.executable, '-m', 'example_train.train'], npp=npp, name='train')
 
     # now simultaneously with training lets sort out what to do with our
     # stragglers. slow hosts are probably ok to keep, they responded
@@ -139,7 +139,7 @@ def train_with_size(ctx, hosts):
     logger.info(f"Training exited successfully.")
 
 def main(N, port):
-    ctx = Context(port=port)
+    ctx = Context(port=port, log_directory=None)
     hosts: List[Host] = ctx.request_hosts(n=N).result()
 
     # if we don't warmup, then we can get started before all of our

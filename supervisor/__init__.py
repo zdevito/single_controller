@@ -14,6 +14,9 @@ import weakref
 import io
 import traceback
 from typing import NamedTuple
+from pathlib import Path
+import sys
+
 logger = logging.getLogger(__name__)
 
 
@@ -277,7 +280,7 @@ class Host:
             p._lost_host()
             return
         self._proc_table[p._id] = p
-        self._send(pickle.dumps(('launch', p._id, p.rank, p.world_size, p.args, p.simulate)))
+        self._send(pickle.dumps(('launch', p._id, p.rank, p.world_size, p.args, p.name, p.simulate, self._context._log_directory)))
         self._context._launches += 1
 
     def __repr__(self):
@@ -290,7 +293,7 @@ class Host:
         return self._on_connection_lost.done()
 
 class Process:
-    def __init__(self, context, host, rank, world_size, args, simulate):
+    def __init__(self, context, host, rank, world_size, args, name, simulate):
         _id = self._id = context._next_id
         context._next_id += 1
         self._context = context
@@ -299,11 +302,12 @@ class Process:
         self.args = args
         self.simulate = simulate
         self.world_size = world_size
+        self.name = f'{name}_rank{rank}'
         hostname = self.host.hostname()
         # self._pid = Future(context, lambda: f'hosts[{repr(_future_value_or_none(hostname))}].process_{_id}.pid()')
         # self._returncode = Future(context, lambda: f'hosts[{repr(_future_value_or_none(hostname))}].process_{_id}.returncode()')
-        self._pid = Future(context, f'process_{_id}.pid()', hostname)
-        self._returncode = Future(context, f'process_{_id}.returncode()', hostname)
+        self._pid = Future(context, f'{self.name}.pid()', hostname)
+        self._returncode = Future(context, f'{self.name}.returncode()', hostname)
 
         self._recvs = []
         self._messages = []
@@ -349,7 +353,7 @@ class Process:
     def recv(self, filter: callable=lambda x: True) -> 'Future[Any]':
         _id = self._id
         hostname = self.host.hostname()
-        fut = Future(self._context, f'process_{_id}.recv()', hostname)
+        fut = Future(self._context, f'{self.name}.recv()', hostname)
         self._context._schedule(lambda: self._recv(fut, filter))
         return fut
 
@@ -390,7 +394,14 @@ class Process:
         self._context._proc_deletes += 1
 
 class Context:
-    def __init__(self, port=55555):
+    def __init__(self, port=55555, log_directory=None):
+        if log_directory is not None:
+            path = Path(log_directory) / "supervisor.log"
+            logger.info(f"Redirect logging to {path}")
+            with open(path, 'w') as f:
+                os.dup2(f.fileno(), sys.stdout.fileno())
+                os.dup2(f.fileno(), sys.stderr.fileno())
+
         self._context = zmq.Context(1)
 
         # to talk to python clients in this process
@@ -424,6 +435,8 @@ class Context:
         self._launches = 0
         self._proc_deletes = 0
         self._exit_event_loop = False
+        self._pg_name = 0
+        self._log_directory = log_directory
 
         self._thread = Thread(target=self._event_loop, daemon=True)
         self._thread.start()
@@ -503,12 +516,12 @@ class Context:
             _time_process += time_end - time_poll
 
             if should_check_heartbeat:
-                self.logstatus(_time_poll / elapsed, _time_process / elapsed)
+                self._logstatus(_time_poll / elapsed, _time_process / elapsed)
                 _time_poll = 0
                 _time_process = 0
 
 
-    def logstatus(self, poll_fraction, active_fraction):
+    def _logstatus(self, poll_fraction, active_fraction):
         host_histogram = {}
         for h in self._name_to_host.values():
             host_histogram[h._state] = host_histogram.setdefault(h._state, 0) + 1
@@ -617,9 +630,12 @@ class Context:
         self._context.term()
 
     # TODO: other arguments like environment, etc.
-    def create_process_group(self, hosts: List[Host], args, npp=1, simulate=False) -> List[Process]:
+    def create_process_group(self, hosts: List[Host], args, npp=1, name=None, simulate=False) -> List[Process]:
         world_size = npp*len(hosts)
-        procs = tuple(Process(self, h, i*npp + j, world_size, args, simulate) for i, h in enumerate(hosts) for j in range(npp))
+        if name is None:
+            name = f'pg{self._pg_name}'
+            self._pg_name += 1
+        procs = tuple(Process(self, h, i*npp + j, world_size, args, name, simulate) for i, h in enumerate(hosts) for j in range(npp))
         self._schedule(lambda: self._launch_processes(procs))
         return procs
 

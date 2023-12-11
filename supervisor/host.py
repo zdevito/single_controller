@@ -10,6 +10,9 @@ from supervisor import HEARTBEAT_INTERVAL
 import signal
 import logging
 import socket
+from pathlib import Path
+from contextlib import nullcontext
+
 
 logger = logging.getLogger()
 ABORT_INTERVAL = 5
@@ -29,7 +32,7 @@ def pidfd_open(pid):
 # the supervisor.
 
 class Process:
-    def __init__(self, proc_comm, proc_id, rank, world_size, args, proc_addr):
+    def __init__(self, name, log_directory, proc_comm, proc_id, rank, world_size, args, proc_addr):
         self.proc_id = proc_id
         self.proc_comm = proc_comm
         environ = dict(os.environ)
@@ -37,7 +40,10 @@ class Process:
         environ['WORLD_SIZE'] = str(world_size)
         environ['SUPERVISOR_PIPE'] = proc_addr
         environ['SUPERVISOR_IDENT'] = str(proc_id)
-        self.subprocess = subprocess.Popen(args, env=environ, start_new_session=True)
+
+        logcontext = nullcontext() if log_directory is None else open(Path(log_directory) / f"{name}.log", 'a')
+        with logcontext as logfile:
+            self.subprocess = subprocess.Popen(args, env=environ, start_new_session=True, stdout=logfile, stderr=logfile)
         self.fd = pidfd_open(self.subprocess.pid)
         self.proc_id_bytes = proc_id.to_bytes(8, byteorder='little')
         self.deferred_sends = []
@@ -85,14 +91,14 @@ class Host:
 
     # TODO: validate these are valid messages to send
 
-    def launch(self, proc_id, rank, world_size, args, simulate):
+    def launch(self, proc_id, rank, world_size, args, name, simulate, log_directory):
         self._launches += 1
         if simulate:
             self.backend.send(pickle.dumps(('_started', proc_id, 2)))
             self.backend.send(pickle.dumps(('_exited', proc_id, 0)))
             return
 
-        process = Process(self.proc_comm, proc_id, rank, world_size, args, self.proc_addr)
+        process = Process(name, log_directory, self.proc_comm, proc_id, rank, world_size, args, self.proc_addr)
         self.process_table[process.proc_id_bytes] = process
         self.fd_to_pid[process.fd] = process.proc_id_bytes
         self.poller.register(process.fd, zmq.POLLIN)
