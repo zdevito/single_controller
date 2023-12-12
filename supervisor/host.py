@@ -78,6 +78,7 @@ class Host:
         self.context = zmq.Context(1)
         self.backend = self.context.socket(zmq.DEALER)
         self.backend.setsockopt(zmq.IPV6, True)
+        logger.info('Host Manager Connecting to %s', supervisor_port)
         self.backend.connect(supervisor_port)
 
         # tell the supervisor we exist, and provide

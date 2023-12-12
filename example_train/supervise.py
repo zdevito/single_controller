@@ -7,6 +7,7 @@ import sys
 import subprocess
 import signal
 from supervisor import as_completed
+from supervisor.launchers import mast
 from contextlib import contextmanager
 import time
 import os
@@ -161,5 +162,4 @@ def main(N, port):
     ctx.shutdown()
 
 if __name__ == '__main__':
-    N = int(sys.argv[1])
-    main(N, 55555)
+    mast(main)
