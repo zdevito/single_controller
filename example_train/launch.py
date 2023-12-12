@@ -32,7 +32,7 @@ def restarting():
                     hosts[i] = create_host()
         time.sleep(.1)
 
-def emulate_mast_launch():
+def emulate_mast_launch(to_launch):
     # for testing the mast launcher entrypoint
     def create_host(i):
         env = {**os.environ}
@@ -40,7 +40,7 @@ def emulate_mast_launch():
         env['MAST_HPC_TASK_GROUP_HOSTNAMES'] = socket.gethostname()
         env['TORCH_ELASTIC_SUPERVISOR'] = str(i == 0)
         env['MAST_HPC_TASK_GROUP_SIZE'] = str(N)
-        return subprocess.Popen([sys.executable,  '-m', 'example_train.supervise'], env=env)
+        return subprocess.Popen(to_launch, env=env)
     hosts = [create_host(i) for i in range(N)]
     while hosts:
         finished = []
@@ -54,5 +54,9 @@ def emulate_mast_launch():
         hosts = [h for h, s in zip(hosts, status) if s is None]
         time.sleep(.1)
 
-emulate_mast_launch()
+if sys.argv[1:]:
+    emulate_mast_launch(sys.argv[1:])
+else:
+    emulate_mast_launch((sys.executable, '-m', 'example_train.supervise'))
+
 #restarting()
