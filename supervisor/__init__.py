@@ -280,7 +280,7 @@ class Host:
             p._lost_host()
             return
         self._proc_table[p._id] = p
-        self._send(pickle.dumps(('launch', p._id, p.rank, p.processes_per_host, p.world_size, p.args, p.env, p.name, p.simulate, self._context._log_directory)))
+        self._send(pickle.dumps(('launch', p._id, p.rank, p.processes_per_host, p.world_size, p.popen, p.name, p.simulate, self._context._log_directory)))
         self._context._launches += 1
 
     def __repr__(self):
@@ -292,8 +292,11 @@ class Host:
     def connection_lost(self):
         return self._on_connection_lost.done()
 
+class ProcessFailedToStart(Exception):
+    pass
+
 class Process:
-    def __init__(self, context, host, rank, processes_per_host, world_size, args, env, name, simulate):
+    def __init__(self, context, host, rank, processes_per_host, world_size, popen, name, simulate):
         _id = self._id = context._next_id
         context._next_id += 1
         self._context = context
@@ -301,8 +304,7 @@ class Process:
         self.rank = rank
         self.processes_per_host = processes_per_host
         self.world_size = world_size
-        self.args = args
-        self.env = env
+        self.popen = popen
         self.simulate = simulate
         self.name = f'{name}_rank{rank}'
         hostname = self.host.hostname()
@@ -326,7 +328,9 @@ class Process:
         return f"Process(rank={self.rank}, host={self.host}, pid={pid})"
 
     def _lost_host(self):
-        e = ConnectionAbortedError("Lost connection to process host")
+        self._abort(ConnectionAbortedError("Lost connection to process host"))
+
+    def _abort(self, e):
         if self._state == 'launched':
             self._pid.set_exception(e)
         if self._state in ['launched', 'running']:
@@ -389,8 +393,11 @@ class Process:
         self._context._exits += 1
 
     def _started(self, pid):
-        self._state = 'running'
-        self._pid.set_result(pid)
+        if isinstance(pid, int):
+            self._state = 'running'
+            self._pid.set_result(pid)
+        else:
+            self._abort(ProcessFailedToStart(pid))
 
     def __del__(self):
         self._context._proc_deletes += 1
@@ -496,7 +503,7 @@ class Context:
             if self._exit_event_loop:
                 return
             t = time.time()
-            should_check_heartbeat = t - self._last_heartbeat_check > HEARTBEAT_INTERVAL*2
+            should_check_heartbeat = t - self._last_heartbeat_check > HEARTBEAT_INTERVAL*HEARTBEAT_LIVENESS
             if should_check_heartbeat:
                 elapsed = t - self._last_heartbeat_check
                 self._last_heartbeat_check = t
@@ -632,12 +639,13 @@ class Context:
         self._context.term()
 
     # TODO: other arguments like environment, etc.
-    def create_process_group(self, hosts: List[Host], args, processes_per_host=1, env=None, name=None, simulate=False) -> List[Process]:
+    def create_process_group(self, hosts: List[Host], args, processes_per_host=1, env=None, cwd=None, name=None, simulate=False) -> List[Process]:
         world_size = processes_per_host*len(hosts)
         if name is None:
             name = f'pg{self._pg_name}'
             self._pg_name += 1
-        procs = tuple(Process(self, h, i*processes_per_host + j, processes_per_host, world_size, args, env, name, simulate) for i, h in enumerate(hosts) for j in range(processes_per_host))
+        popen = {'args': args, 'env': env, 'cwd': cwd}
+        procs = tuple(Process(self, h, i*processes_per_host + j, processes_per_host, world_size, popen, name, simulate) for i, h in enumerate(hosts) for j in range(processes_per_host))
         self._schedule(lambda: self._launch_processes(procs))
         return procs
 

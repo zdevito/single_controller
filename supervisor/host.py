@@ -2,11 +2,13 @@ import zmq
 import sys
 import time
 import os
+import io
+import traceback
 import pickle
 import subprocess
 from typing import NamedTuple, Any
 import ctypes
-from supervisor import HEARTBEAT_INTERVAL
+from supervisor import HEARTBEAT_INTERVAL, HEARTBEAT_LIVENESS, ProcessFailedToStart
 import signal
 import logging
 import socket
@@ -16,8 +18,6 @@ from contextlib import nullcontext
 
 logger = logging.getLogger()
 ABORT_INTERVAL = 5
-HEARTBEAT_LIVENESS = 3     # 3..5 is reasonable
-HEARTBEAT_INTERVAL = 1.0
 __NR_pidfd_open = 434
 libc = ctypes.CDLL(None)
 syscall = libc.syscall
@@ -32,22 +32,28 @@ def pidfd_open(pid):
 # the supervisor.
 
 class Process:
-    def __init__(self, name, log_directory, proc_comm, proc_id, rank, processes_per_host, world_size, args, env, proc_addr):
+    def __init__(self, name, log_directory, proc_comm, proc_id, rank, processes_per_host, world_size, popen, proc_addr):
         self.proc_id = proc_id
         self.proc_comm = proc_comm
         environ = dict(os.environ)
-        if env is not None:
-            environ.update(env)
+        if popen['env'] is not None:
+            environ.update(popen['env'])
         environ['RANK'] = str(rank)
         environ['WORLD_SIZE'] = str(world_size)
         environ['LOCAL_RANK'] = str(rank % processes_per_host)
         environ['LOCAL_WORLD_SIZE'] = str(processes_per_host)
         environ['SUPERVISOR_PIPE'] = proc_addr
         environ['SUPERVISOR_IDENT'] = str(proc_id)
-
-        logcontext = nullcontext() if log_directory is None else open(Path(log_directory) / f"{name}.log", 'a')
-        with logcontext as logfile:
-            self.subprocess = subprocess.Popen(args, env=environ, start_new_session=True, stdout=logfile, stderr=logfile)
+        popen = {**popen, 'env': environ}
+        try:
+            logcontext = nullcontext() if log_directory is None else open(Path(log_directory) / f"{name}.log", 'a')
+            with logcontext as logfile:
+                self.subprocess = subprocess.Popen(**popen, start_new_session=True, stdout=logfile, stderr=logfile)
+        except Exception as e:
+            s = io.StringIO()
+            traceback.print_exc(file=s)
+            logger.warn(f"Process failed to start: %s\n", s.getvalue())
+            raise ProcessFailedToStart(s.getvalue())
         self.fd = pidfd_open(self.subprocess.pid)
         self.proc_id_bytes = proc_id.to_bytes(8, byteorder='little')
         self.deferred_sends = []
@@ -95,18 +101,21 @@ class Host:
 
     # TODO: validate these are valid messages to send
 
-    def launch(self, proc_id, rank, processes_per_rank, world_size, args, env, name, simulate, log_directory):
+    def launch(self, proc_id, rank, processes_per_rank, world_size, popen, name, simulate, log_directory):
         self._launches += 1
         if simulate:
             self.backend.send(pickle.dumps(('_started', proc_id, 2)))
             self.backend.send(pickle.dumps(('_exited', proc_id, 0)))
             return
-
-        process = Process(name, log_directory, self.proc_comm, proc_id, rank, processes_per_rank, world_size, args, env, self.proc_addr)
-        self.process_table[process.proc_id_bytes] = process
-        self.fd_to_pid[process.fd] = process.proc_id_bytes
-        self.poller.register(process.fd, zmq.POLLIN)
-        self.backend.send(pickle.dumps(('_started', process.proc_id, process.subprocess.pid)))
+        try:
+            process = Process(name, log_directory, self.proc_comm, proc_id, rank, processes_per_rank, world_size, popen, self.proc_addr)
+            self.process_table[process.proc_id_bytes] = process
+            self.fd_to_pid[process.fd] = process.proc_id_bytes
+            self.poller.register(process.fd, zmq.POLLIN)
+            reply = process.subprocess.pid
+        except ProcessFailedToStart as e:
+            reply = str(e)
+        self.backend.send(pickle.dumps(('_started', proc_id, reply)))
 
     def send(self, proc_id, msg):
         proc_id = proc_id.to_bytes(8, byteorder='little')
