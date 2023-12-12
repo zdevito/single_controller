@@ -32,12 +32,16 @@ def pidfd_open(pid):
 # the supervisor.
 
 class Process:
-    def __init__(self, name, log_directory, proc_comm, proc_id, rank, world_size, args, proc_addr):
+    def __init__(self, name, log_directory, proc_comm, proc_id, rank, processes_per_host, world_size, args, env, proc_addr):
         self.proc_id = proc_id
         self.proc_comm = proc_comm
         environ = dict(os.environ)
+        if env is not None:
+            environ.update(env)
         environ['RANK'] = str(rank)
         environ['WORLD_SIZE'] = str(world_size)
+        environ['LOCAL_RANK'] = str(rank % processes_per_host)
+        environ['LOCAL_WORLD_SIZE'] = str(processes_per_host)
         environ['SUPERVISOR_PIPE'] = proc_addr
         environ['SUPERVISOR_IDENT'] = str(proc_id)
 
@@ -91,14 +95,14 @@ class Host:
 
     # TODO: validate these are valid messages to send
 
-    def launch(self, proc_id, rank, world_size, args, name, simulate, log_directory):
+    def launch(self, proc_id, rank, processes_per_rank, world_size, args, env, name, simulate, log_directory):
         self._launches += 1
         if simulate:
             self.backend.send(pickle.dumps(('_started', proc_id, 2)))
             self.backend.send(pickle.dumps(('_exited', proc_id, 0)))
             return
 
-        process = Process(name, log_directory, self.proc_comm, proc_id, rank, world_size, args, self.proc_addr)
+        process = Process(name, log_directory, self.proc_comm, proc_id, rank, processes_per_rank, world_size, args, env, self.proc_addr)
         self.process_table[process.proc_id_bytes] = process
         self.fd_to_pid[process.fd] = process.proc_id_bytes
         self.poller.register(process.fd, zmq.POLLIN)

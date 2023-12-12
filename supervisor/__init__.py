@@ -280,7 +280,7 @@ class Host:
             p._lost_host()
             return
         self._proc_table[p._id] = p
-        self._send(pickle.dumps(('launch', p._id, p.rank, p.world_size, p.args, p.name, p.simulate, self._context._log_directory)))
+        self._send(pickle.dumps(('launch', p._id, p.rank, p.processes_per_host, p.world_size, p.args, p.env, p.name, p.simulate, self._context._log_directory)))
         self._context._launches += 1
 
     def __repr__(self):
@@ -293,15 +293,17 @@ class Host:
         return self._on_connection_lost.done()
 
 class Process:
-    def __init__(self, context, host, rank, world_size, args, name, simulate):
+    def __init__(self, context, host, rank, processes_per_host, world_size, args, env, name, simulate):
         _id = self._id = context._next_id
         context._next_id += 1
         self._context = context
         self.host = host
         self.rank = rank
-        self.args = args
-        self.simulate = simulate
+        self.processes_per_host = processes_per_host
         self.world_size = world_size
+        self.args = args
+        self.env = env
+        self.simulate = simulate
         self.name = f'{name}_rank{rank}'
         hostname = self.host.hostname()
         # self._pid = Future(context, lambda: f'hosts[{repr(_future_value_or_none(hostname))}].process_{_id}.pid()')
@@ -630,12 +632,12 @@ class Context:
         self._context.term()
 
     # TODO: other arguments like environment, etc.
-    def create_process_group(self, hosts: List[Host], args, npp=1, name=None, simulate=False) -> List[Process]:
-        world_size = npp*len(hosts)
+    def create_process_group(self, hosts: List[Host], args, processes_per_host=1, env=None, name=None, simulate=False) -> List[Process]:
+        world_size = processes_per_host*len(hosts)
         if name is None:
             name = f'pg{self._pg_name}'
             self._pg_name += 1
-        procs = tuple(Process(self, h, i*npp + j, world_size, args, name, simulate) for i, h in enumerate(hosts) for j in range(npp))
+        procs = tuple(Process(self, h, i*processes_per_host + j, processes_per_host, world_size, args, env, name, simulate) for i, h in enumerate(hosts) for j in range(processes_per_host))
         self._schedule(lambda: self._launch_processes(procs))
         return procs
 

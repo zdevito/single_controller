@@ -9,9 +9,9 @@ import signal
 from supervisor import as_completed
 from contextlib import contextmanager
 import time
+import os
 
 logger = logging.getLogger(__name__)
-
 
 def start_training(ctx, N: int, hosts: List[Host], npp: int, run_fraction=.5, rank_fraction=.75):
     # we will use 10% of machines as fallover machines.
@@ -22,7 +22,7 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int, run_fraction=.5, ra
     # to find the 90% percentile machines and exclude the bottom 10%.
 
     logger.info(f"starting health checks host {len(hosts)} hosts")
-    pg: List[Process] = ctx.create_process_group(hosts, args=[sys.executable, '-m', 'example_train.health_check'], npp=1, name='health_check')
+    pg: List[Process] = ctx.create_process_group(hosts, args=[sys.executable, '-m', 'example_train.health_check'], processes_per_host=1, name='health_check')
 
     health_responses: Dict[Future[Any], Process] = {p.recv(): p for p in pg}
 
@@ -64,7 +64,13 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int, run_fraction=.5, ra
 
     # Let's get training started.
     logger.info(f"Launching {npp*desired_run_size} processes")
-    process_group = ctx.create_process_group(good_hosts, args=[sys.executable, '-m', 'example_train.train'], npp=npp, name='train')
+    env = {
+        'OMP_NUM_THREADS': '1',
+        'TORCH_NCCL_ASYNC_ERROR_HANDLING': os.environ.get('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1'),
+        'MASTER_ADDR': f'{good_hosts[0].hostname().result()}.facebook.com',
+        'MASTER_PORT': str(50687),
+    }
+    process_group = ctx.create_process_group(good_hosts, args=[sys.executable, '-m', 'example_train.train'], processes_per_host=npp, env=env, name='train')
 
     # now simultaneously with training lets sort out what to do with our
     # stragglers. slow hosts are probably ok to keep, they responded
@@ -116,7 +122,7 @@ def train_with_size(ctx, hosts):
     # request and wait for the hosts to get provided.
     complete = False
     while not complete:
-        process_group, current_hosts = start_training(ctx, N, hosts, npp, run_fraction=1, rank_fraction=1)
+        process_group, current_hosts = start_training(ctx, N, hosts, npp=npp, run_fraction=1, rank_fraction=1)
         logger.info(f"Process group size {len(process_group)}")
         complete = True
         for f in as_completed([f.returncode() for f in process_group]):
