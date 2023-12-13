@@ -40,7 +40,7 @@ class Future:
         status = 'exception' if self._was_exception else 'complete' if self._complete else 'incomplete'
         hostname = self._hostname_future
         if hostname is None:
-            return 'Future[{status}, {self._name}]'
+            return f'Future[{status}, {self._name}]'
 
         if hostname.done() and hostname.exception() is None:
             hostname = repr(hostname.result())
@@ -234,14 +234,19 @@ class Host:
         self._state = 'unconnected'
         self._deferred_sends = []
         self._proc_table = weakref.WeakValueDictionary()
-        self._tcphostname = Future(context, 'hostname', None)
-        self._on_connection_lost = Future(context, 'host_connection_lost', self._tcphostname)
+        self._hostname_future = Future(context, 'hostname', None)
+        self._hostname_value = None
+        self._on_connection_lost = Future(context, 'host_connection_lost', self._hostname_future)
 
     def hostname(self):
-        return self._tcphostname
+        return self._hostname_future
+
+    def _set_hostname(self, hostname):
+        self._hostname_value = hostname # for event_handler thread use
+        self._hostname_future.set_result(hostname) # for client use
 
     def _hostname(self, hostname):
-        self._tcphostname.set_result(hostname)
+        self._set_hostname(hostname)
         # let the host know we have received its connection
         self._send(b'')
 
@@ -466,6 +471,10 @@ class Context:
                         if self._unassigned_hosts:
                             host = self._unassigned_hosts.popleft()
                         else:
+                            # TODO: unassigned connections and dead connections
+                            # should not be host objects, it is too easy to get them wrong.
+                            # instead, we should have a different object for dead connections
+                            # and connections that haven't been matched yet.
                             host = Host(self)
                             self._unassigned_connections.append(host)
                         host._connect(f)
@@ -580,6 +589,7 @@ class Context:
             self._unassigned_hosts.append(h)
         else:
             h._connect(u._name)
+            h._set_hostname(u._hostname_value)
 
     def _request_hosts(self, hosts):
         for h in hosts:
