@@ -136,6 +136,9 @@ class Host:
     def _fd_exit(self, fd):
         pid_bytes = self.fd_to_pid.pop(fd)
         process = self.process_table.pop(pid_bytes)
+        # we do not allow descendents to outlive the parent
+        # if any remain this kill will clean them up
+        os.killpg(process.subprocess.pid, signal.SIGKILL)
         returncode = process.subprocess.wait()
         self.poller.unregister(fd)
         os.close(fd)

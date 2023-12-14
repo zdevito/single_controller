@@ -16,13 +16,17 @@ import traceback
 from typing import NamedTuple
 from pathlib import Path
 import sys
-
 logger = logging.getLogger(__name__)
 
 
 HEARTBEAT_LIVENESS = 3     # 3..5 is reasonable
 HEARTBEAT_INTERVAL = 1.0
 
+def _get_hostname(hostname_future):
+    if hostname_future.done() and hostname_future.exception() is None:
+        return repr(hostname_future.result())
+    else:
+        return 'unconnected'
 
 class Future:
     """Represents the result of an asynchronous computation."""
@@ -42,10 +46,7 @@ class Future:
         if hostname is None:
             return f'Future[{status}, {self._name}]'
 
-        if hostname.done() and hostname.exception() is None:
-            hostname = repr(hostname.result())
-        else:
-            hostname = 'unconnected'
+        hostname = _get_hostname(hostname)
         return f"Future[{status}, hosts[{hostname}].{self._name}]"
 
     def done(self):
@@ -238,6 +239,9 @@ class Host:
         self._hostname_value = None
         self._on_connection_lost = Future(context, 'host_connection_lost', self._hostname_future)
 
+    def __repr__(self):
+        return f"Host[{_get_hostname(self._hostname_future)}]"
+
     def hostname(self):
         return self._hostname_future
 
@@ -287,9 +291,6 @@ class Host:
         self._proc_table[p._id] = p
         self._send(pickle.dumps(('launch', p._id, p.rank, p.processes_per_host, p.world_size, p.popen, p.name, p.simulate, self._context._log_directory)))
         self._context._launches += 1
-
-    def __repr__(self):
-        return f"Host({self._name})"
 
     def on_connection_lost(self):
         return self._on_connection_lost
@@ -509,6 +510,8 @@ class Context:
                         self._requests_ready.recv()
                         fn = self._requests.popleft()
                         fn()
+                        del fn # otherwise we old a handle until
+                               # the next time we run a command
             if self._exit_event_loop:
                 return
             t = time.time()
@@ -545,7 +548,6 @@ class Context:
             host_histogram[h._state] = host_histogram.setdefault(h._state, 0) + 1
         logger.info("supervisor status: %s process launches, %s exits, %s message sends, %s message responses, %s process __del__, %s host handles without hosts, %s connected hosts without handles, time is %.2f%% polling and %.2f%% active, hosts %s",
          self._launches, self._exits, self._sends, self._responses, self._proc_deletes, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
-
 
     def _debug_dict(self):
         return self.__dict__

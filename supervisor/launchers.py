@@ -23,7 +23,12 @@ def mast(supervise):
     if is_supervisor:
         # local host manager on supervisor machine
         host_process = subprocess.Popen([sys.executable, '-m', 'supervisor.host', supervisor_addr])
-        supervise(N, PORT)
+        try:
+            supervise(N, PORT)
+        except:
+            host_process.kill()
+            host_process.wait()
+            raise
     else:
         # host manager on non-supervisor machine
         main(supervisor_addr)

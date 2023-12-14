@@ -3,6 +3,10 @@ import os
 import random
 import time
 import signal
+import subprocess
+
+# to check if it will clean up the subprocess when trainer exits
+# new_proc = subprocess.Popen(['python', '-c', 'while True:\n  print(0)\n  import time; time.sleep(.3)\n'])
 
 rank = int(os.environ['RANK'])
 # for i in range(100):
