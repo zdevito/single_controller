@@ -42,6 +42,7 @@ def emulate_mast_launch(to_launch):
         env['MAST_HPC_TASK_GROUP_SIZE'] = str(N)
         return subprocess.Popen(to_launch, env=env)
     hosts = [create_host(i) for i in range(N)]
+    print("PIDS", [h.pid for h in hosts])
     while hosts:
         finished = []
         status = [h.poll() for h in hosts]

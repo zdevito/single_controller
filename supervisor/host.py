@@ -32,7 +32,7 @@ def pidfd_open(pid):
 # the supervisor.
 
 class Process:
-    def __init__(self, name, log_directory, proc_comm, proc_id, rank, processes_per_host, world_size, popen, proc_addr):
+    def __init__(self, name, logfilename, proc_comm, proc_id, rank, processes_per_host, world_size, popen, proc_addr):
         self.proc_id = proc_id
         self.proc_comm = proc_comm
         environ = dict(os.environ)
@@ -46,7 +46,7 @@ class Process:
         environ['SUPERVISOR_IDENT'] = str(proc_id)
         popen = {**popen, 'env': environ}
         try:
-            logcontext = nullcontext() if log_directory is None else open(Path(log_directory) / f"{name}.log", 'a')
+            logcontext = nullcontext() if logfilename is None else open(logfilename, 'a')
             with logcontext as logfile:
                 self.subprocess = subprocess.Popen(**popen, start_new_session=True, stdout=logfile, stderr=logfile)
         except Exception as e:
@@ -102,14 +102,14 @@ class Host:
 
     # TODO: validate these are valid messages to send
 
-    def launch(self, proc_id, rank, processes_per_rank, world_size, popen, name, simulate, log_directory):
+    def launch(self, proc_id, rank, processes_per_rank, world_size, popen, name, simulate, log_file):
         self._launches += 1
         if simulate:
             self.backend.send(pickle.dumps(('_started', proc_id, 2)))
             self.backend.send(pickle.dumps(('_exited', proc_id, 0)))
             return
         try:
-            process = Process(name, log_directory, self.proc_comm, proc_id, rank, processes_per_rank, world_size, popen, self.proc_addr)
+            process = Process(name, log_file, self.proc_comm, proc_id, rank, processes_per_rank, world_size, popen, self.proc_addr)
             self.process_table[process.proc_id_bytes] = process
             self.fd_to_pid[process.fd] = process.proc_id_bytes
             self.poller.register(process.fd, zmq.POLLIN)

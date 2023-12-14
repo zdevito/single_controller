@@ -146,7 +146,7 @@ def train_with_size(ctx, hosts):
     logger.info(f"Training exited successfully.")
 
 def main(N, port):
-    ctx = Context(port=port, log_directory=None)
+    ctx = Context(port=port, log_format='/tmp/dedicated_{name}{rank}.log')
     hosts: List[Host] = ctx.request_hosts(n=N).result()
 
     # if we don't warmup, then we can get started before all of our

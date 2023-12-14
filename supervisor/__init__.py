@@ -289,7 +289,7 @@ class Host:
             p._lost_host()
             return
         self._proc_table[p._id] = p
-        self._send(pickle.dumps(('launch', p._id, p.rank, p.processes_per_host, p.world_size, p.popen, p.name, p.simulate, self._context._log_directory)))
+        self._send(pickle.dumps(('launch', p._id, p.rank, p.processes_per_host, p.world_size, p.popen, p.name, p.simulate, p.logfile)))
         self._context._launches += 1
 
     def on_connection_lost(self):
@@ -312,10 +312,9 @@ class Process:
         self.world_size = world_size
         self.popen = popen
         self.simulate = simulate
-        self.name = f'{name}_rank{rank}'
+        self.name = f'{name}_rank{str(rank).zfill(len(str(world_size)))}'
+        self.logfile = None if context._log_format is None else context._log_format.format(name=self.name)
         hostname = self.host.hostname()
-        # self._pid = Future(context, lambda: f'hosts[{repr(_future_value_or_none(hostname))}].process_{_id}.pid()')
-        # self._returncode = Future(context, lambda: f'hosts[{repr(_future_value_or_none(hostname))}].process_{_id}.returncode()')
         self._pid = Future(context, f'{self.name}.pid()', hostname)
         self._returncode = Future(context, f'{self.name}.returncode()', hostname)
 
@@ -409,9 +408,9 @@ class Process:
         self._context._proc_deletes += 1
 
 class Context:
-    def __init__(self, port=55555, log_directory=None):
-        if log_directory is not None:
-            path = Path(log_directory) / "supervisor.log"
+    def __init__(self, port=55555, log_format=None):
+        if log_format is not None:
+            path = log_format.format(name='supervisor')
             logger.info(f"Redirect logging to {path}")
             with open(path, 'w') as f:
                 os.dup2(f.fileno(), sys.stdout.fileno())
@@ -451,7 +450,7 @@ class Context:
         self._proc_deletes = 0
         self._exit_event_loop = False
         self._pg_name = 0
-        self._log_directory = log_directory
+        self._log_format = log_format
 
         self._thread = Thread(target=self._event_loop, daemon=True)
         self._thread.start()
