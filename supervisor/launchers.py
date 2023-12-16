@@ -31,4 +31,9 @@ def mast(supervise):
             raise
     else:
         # host manager on non-supervisor machine
-        main(supervisor_addr)
+        host_process = subprocess.Popen([sys.executable, '-m', 'supervisor.host', supervisor_addr])
+        result = host_process.wait()
+        if result != 0:
+            # Until we can use HPC_TASK level restarts, workaround it,
+            # by not letting host machines report an error even when the machine fails.
+            logger.info(f"Host manager exited with non-zero code {result}, but we are exiting cleanly so the fleet wide job doesn't end.")
