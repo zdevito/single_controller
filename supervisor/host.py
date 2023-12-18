@@ -184,10 +184,12 @@ class Host:
                         getattr(self, cmd)(*args)
                 elif s is self.proc_comm:
                     proc_id_bytes, msg = self.proc_comm.recv_multipart()
-                    process = self.process_table[proc_id_bytes]
-                    process._notify_connected()
+                    process = self.process_table.get(proc_id_bytes)
+                    if process is not None:
+                        process._notify_connected()
                     if len(msg):
-                        self.backend.send(pickle.dumps(('_response', process.proc_id, msg)))
+                        proc_id = int.from_bytes(proc_id_bytes, byteorder='little')
+                        self.backend.send(pickle.dumps(('_response', proc_id, msg)))
 
             if expiry is not None:
                 t = time.time()
