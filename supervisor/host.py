@@ -75,7 +75,7 @@ class Process:
         except Exception:
             s = io.StringIO()
             traceback.print_exc(file=s)
-            logger.warn(f"Process failed to start: %s\n", s.getvalue())
+            logger.warning(f"Process failed to start: %s\n", s.getvalue())
             raise ProcessFailedToStart(s.getvalue())
         self.fd: int = pidfd_open(self.subprocess.pid)
         self.proc_id_bytes: bytes = proc_id.to_bytes(8, byteorder="little")
@@ -119,6 +119,7 @@ class Host:
         self.process_table: Dict[bytes, Process] = {}
         self.fd_to_pid: Dict[int, bytes] = {}
         self._launches = 0
+        self.has_shutdown = False
 
     def heartbeat(self) -> None:
         self.backend.send(b"")
@@ -188,6 +189,9 @@ class Host:
         return process, returncode
 
     def shutdown(self) -> None:
+        if self.has_shutdown:
+            return
+        self.has_shutdown = True
         for proc in self.process_table.values():
             os.killpg(proc.subprocess.pid, signal.SIGTERM)
         expiry = time.time() + ABORT_INTERVAL
@@ -200,6 +204,7 @@ class Host:
         if self.process_table:
             for proc in self.process_table.values():
                 os.killpg(proc.subprocess.pid, signal.SIGKILL)
+
 
     def abort(self, with_error: Optional[str] = None) -> None:
         self.shutdown()
@@ -236,7 +241,6 @@ class Host:
                     if len(msg):
                         proc_id = int.from_bytes(proc_id_bytes, byteorder="little")
                         self.backend.send(pickle.dumps(("_response", proc_id, msg)))
-
             if expiry is not None:
                 t = time.time()
                 if t > heartbeat_at:

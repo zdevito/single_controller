@@ -1,10 +1,23 @@
-from supervisor import Context, as_completed, Future
+from supervisor import Context, as_completed, Future, get_message_queue
 import unittest
 from unittest.mock import patch, Mock
 from contextlib import contextmanager
 import supervisor
 import time
+from queue import Queue
+import subprocess
+import zmq
+import os
+import pickle
+import threading
+import supervisor.host
+import logging
+from socket import gethostname
+import signal
 
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO
+)
 @contextmanager
 def context():
     try:
@@ -12,6 +25,79 @@ def context():
         yield ctx
     finally:
         ctx.shutdown()
+
+@contextmanager
+def mock_process_handling():
+    class Interface:
+        pass
+    lock = threading.Lock()
+    all_processes = []
+    def killpg(pid, return_code):
+        with lock:
+            p = all_processes[pid]
+            if p.immortal and return_code != signal.SIGKILL:
+                return
+            if not hasattr(p, 'returncode'):
+                p.returncode = return_code
+                with os.fdopen(p._done_w, "w") as f:
+                    f.write('done')
+
+    class MockPopen:
+        def __init__(self, *args, fail=False, immortal=False, **kwargs):
+            if fail:
+                raise RuntimeError("process fail")
+            with lock:
+                self.args = args
+                self.kwargs = kwargs
+                self.immortal = immortal
+                self.pid = len(all_processes)
+                all_processes.append(self)
+                self.signals_sent = []
+                self._done_r, self._done_w = os.pipe()
+
+        def send_signal(self, sig):
+            killpg(self.pid, sig)
+
+        def wait(self):
+            return self.returncode
+
+    def mock_pidfdopen(pid):
+        with lock:
+            return all_processes[pid]._done_r
+
+    with patch.object(subprocess, 'Popen', MockPopen), patch.object(supervisor.host, 'pidfd_open', mock_pidfdopen), patch.object(os, 'killpg', killpg):
+        yield killpg
+
+@contextmanager
+def connected_host():
+    context: zmq.Context = zmq.Context(1)
+    backend = context.socket(zmq.ROUTER)
+    backend.setsockopt(zmq.IPV6, True)
+    backend.bind("tcp://*:55555")
+    exited = None
+    host = supervisor.host.Host('tcp://127.0.0.1:55555')
+    def run_host():
+        nonlocal exited
+        try:
+            host.run_event_loop_forever()
+        except ConnectionAbortedError as e:
+            exited = e
+        except SystemExit:
+            exited = True
+
+    thread = threading.Thread(target=run_host, daemon=True)
+    thread.start()
+    try:
+        yield backend, host
+    finally:
+        backend.close()
+        context.term()
+        thread.join(timeout=1)
+        if thread.is_alive():
+            raise RuntimeError("thread did not terminate")
+    host.context.destroy(linger=500)
+    if exited != True:
+        raise exited
 
 class TestSupervisor(unittest.TestCase):
     def test_future(self):
@@ -113,6 +199,70 @@ class TestSupervisor(unittest.TestCase):
             ctx._schedule(lambda: futures[4].set_exception(ValueError()))
             x = supervisor.wait(futures[4:6], return_when=supervisor.FIRST_EXCEPTION)
             self.assertTrue(futures[4] in x.done)
+
+    @patch('subprocess.Popen', 'subprocess.')
+    def test_host_manager(self):
+        with mock_process_handling() as kill, connected_host() as (socket, host), patch.object(supervisor.host, 'ABORT_INTERVAL', 0.01):
+            f, msg = socket.recv_multipart()
+            _hostname, _, hostname = pickle.loads(msg)
+            def launch(proc_id, rank=0, processes_per_rank=1, world_size=1, popen={"env": None}, name='fake', simulate=False, log_file=None):
+                msg = ('launch', proc_id, rank, processes_per_rank, world_size, popen, name, simulate, log_file)
+                socket.send_multipart([f, pickle.dumps(msg)])
+            def send(msg):
+                socket.send_multipart([f, pickle.dumps(msg)])
+            def recv():
+                return pickle.loads(socket.recv_multipart()[1])
+            self.assertEqual(_hostname, "_hostname")
+            self.assertEqual(hostname, gethostname())
+
+            launch(1)
+            self.assertEqual(recv(), ('_started', 1, 0))
+            kill(0, 4)
+            self.assertEqual(recv(), ('_exited', 1, 4))
+
+            launch(2)
+            self.assertEqual(recv(), ('_started', 2, 1))
+            send(('send', 2, "a message"))
+            msg_queue = get_message_queue(2, host.proc_addr)
+            self.assertEqual(pickle.loads(msg_queue.recv()), "a message")
+            send(('send', 2, "another message"))
+            self.assertEqual(pickle.loads(msg_queue.recv()), "another message")
+            msg_queue.send(b'a reply')
+            msg_queue.close()
+            msg_queue.context.term()
+            self.assertEqual(recv(), ('_response', 2, b'a reply'))
+            send(('signal', 2, 8, True))
+            self.assertEqual(recv(), ('_exited', 2, 8))
+            launch(3, popen = {'env': {'foo': '3'}})
+            self.assertEqual(recv(), ('_started', 3, 2))
+            send(('signal', 3, 9, False))
+            self.assertEqual(recv(), ('_exited', 3, 9))
+            launch(4, popen={'fail': True, 'env': None})
+            _started, _, msg = recv()
+            self.assertEqual(_started, '_started')
+            self.assertIn('process fail', msg)
+            launch(5, simulate=True)
+            self.assertEqual(recv(), ('_started', 5, 2))
+            self.assertEqual(recv(), ('_exited', 5, 0))
+            launch(6) # leave something open
+            launch(7, popen={'immortal': True, 'env': None})
+            send(('abort', None))
+        # test double shutodwn
+        host.shutdown()
+
+        with self.assertRaises(ConnectionAbortedError):
+            with connected_host() as (socket, _):
+                f, msg = socket.recv_multipart()
+                socket.send_multipart([f, pickle.dumps(('abort', 'An error'))])
+
+    def test_host_timeout_and_heartbeat(self):
+        with self.assertRaises(ConnectionAbortedError):
+            with patch.object(supervisor.host, "HEARTBEAT_INTERVAL", .01), connected_host() as (socket, host):
+                f, msg = socket.recv_multipart()
+                socket.send_multipart([f, b""])
+                time.sleep(0.1)
+                f, msg = socket.recv_multipart()
+                self.assertEqual(msg, b"")
 
 
 

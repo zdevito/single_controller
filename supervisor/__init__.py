@@ -867,7 +867,7 @@ class Context:
                 yield read_futures()
 
 
-def get_message_queue() -> zmq.Socket:
+def get_message_queue(supervisor_ident: Optional[int]=None, supervisor_pipe: Optional[str]=None) -> zmq.Socket:
     """
     Processes launched on the hosts can use this function to connect
     to the messaging queue of the supervisor.
@@ -875,10 +875,14 @@ def get_message_queue() -> zmq.Socket:
     Messages send from here can be received by the supervisor using
     `proc.recv()` and messages from proc.send() will appear in this queue.
     """
+    if supervisor_ident is None:
+        supervisor_ident = int(os.environ["SUPERVISOR_IDENT"])
+    if supervisor_pipe is None:
+        supervisor_pipe = os.environ["SUPERVISOR_PIPE"]
     ctx = zmq.Context(1)
     sock = ctx.socket(zmq.DEALER)
-    proc_id = int(os.environ["SUPERVISOR_IDENT"]).to_bytes(8, byteorder="little")
+    proc_id = supervisor_ident.to_bytes(8, byteorder="little")
     sock.setsockopt(zmq.IDENTITY, proc_id)
-    sock.connect(os.environ["SUPERVISOR_PIPE"])
+    sock.connect(supervisor_pipe)
     sock.send(b"")
     return sock
