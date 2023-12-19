@@ -185,6 +185,8 @@ class Host:
                 elif s is self.proc_comm:
                     proc_id_bytes, msg = self.proc_comm.recv_multipart()
                     process = self.process_table.get(proc_id_bytes)
+                    # it is possible for the process to have already exited before
+                    # we get its messages, so process_table will be empty
                     if process is not None:
                         process._notify_connected()
                     if len(msg):

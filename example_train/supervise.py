@@ -2,7 +2,7 @@ import logging
 logging.basicConfig(format='%(asctime)s %(levelname)s:%(name)s:%(message)s', level=logging.INFO)
 
 from supervisor import Context, Host, Process, Future
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 import sys
 import subprocess
 import signal
@@ -14,7 +14,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-def start_training(ctx, N: int, hosts: List[Host], npp: int, run_fraction=.5, rank_fraction=.75):
+def start_training(ctx, N: int, hosts: Set[Host], npp: int, run_fraction=.5, rank_fraction=.75):
     # we will use 10% of machines as fallover machines.
     desired_run_size: int = int(run_fraction*N)
 
@@ -89,12 +89,13 @@ def start_training(ctx, N: int, hosts: List[Host], npp: int, run_fraction=.5, ra
 
     # the remaining hosts in health_responses have either not responded
     # or are unhealthy.
-    # unhealthy_hosts = [proc.host for proc in health_responses.values()]
+    unhealthy_hosts = [proc.host for proc in health_responses.values()]
     logger.info(f"Replacing unhealthy hosts: {unhealthy_hosts}")
     # We will ask the these hosts get replaced in the job scheduler.
     # All work scheduled on them will be aborted/cancelled.
 
-    ctx.replace_hosts(unhealthy_hosts)
+    hosts.difference_update(unhealthy_hosts)
+    hosts.update(ctx.replace_hosts(unhealthy_hosts))
     # Mechanically, this will cause the host manager on the host to
     # exit with an error condition. If MAST is in TASK-level scope,
     # this will cause mast to reschedule that host somewhere else
@@ -108,6 +109,7 @@ def healthy(score):
 
 
 def train_with_size(ctx, hosts):
+    hosts = set(hosts)
     npp = 8
     N = len(hosts)
     logger.info(f"Starting training with {N} hosts, {npp} processes per host.")
@@ -132,7 +134,9 @@ def train_with_size(ctx, hosts):
                 # training has failed, clean up the training processes
                 for p in process_group:
                     p.signal(signal.SIGTERM) # TODO: maybe have a broadcasting signal function.
-                ctx.replace_hosts(h for h in current_hosts if h.connection_lost())
+                disconnected = [h for h in current_hosts if h.connection_lost()]
+                hosts.difference_update(disconnected)
+                hosts.update(ctx.replace_hosts(disconnected))
                 # policy-wise, there are a few ways to move forward
                 # we can try to ensure all the signals were delivered
                 # and the processes were killed, following up
@@ -144,20 +148,22 @@ def train_with_size(ctx, hosts):
                 complete = False
                 break
     logger.info(f"Training exited successfully.")
+    return list(hosts)
 
 def main(N, port):
-    ctx = Context(port=port, log_format='/tmp/dedicated_{name}{rank}.log')
-    hosts: List[Host] = ctx.request_hosts(n=N).result()
+    #ctx = Context(port=port, log_format='/tmp/dedicated_{name}.log')
+    ctx = Context(port=port)
+    hosts: List[Host] = ctx.request_hosts(n=N)
 
     # if we don't warmup, then we can get started before all of our
     # other hosts have checked in.
     logger.info(f"Beginning warmup")
-    train_with_size(ctx, hosts)
+    hosts = train_with_size(ctx, hosts)
     logger.info(f"Warmup finished.")
 
     to_train = 1
     while to_train <= N:
-        train_with_size(ctx, hosts[:to_train])
+        hosts[:to_train] = train_with_size(ctx, hosts[:to_train])
         to_train *= 2
     ctx.shutdown()
 

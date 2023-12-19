@@ -13,11 +13,13 @@ import os
 import weakref
 import io
 import traceback
-from typing import NamedTuple
+from typing import NamedTuple, Generic, TypeVar, Tuple, Callable, Sequence, Iterable
+from enum import Enum
 from pathlib import Path
 import sys
 logger = logging.getLogger(__name__)
 
+T = TypeVar('T')
 
 HEARTBEAT_LIVENESS = 3     # 3..5 is reasonable
 HEARTBEAT_INTERVAL = 1.0
@@ -28,7 +30,7 @@ def _get_hostname(hostname_future):
     else:
         return 'unconnected'
 
-class Future:
+class Future(Generic[T]):
     """Represents the result of an asynchronous computation."""
     def __init__(self, context, name, hostname_future):
         """Initializes the future. Should not be called by clients."""
@@ -151,7 +153,7 @@ class Future:
         Should only be used by Executor implementations and unit tests.
         """
         if self._complete:
-            raise ValueError('Future already completed')
+            raise ValueError('Future %s already completed', self)
         self._complete = True
         self._value = value
         self._was_exception = was_exception
@@ -212,8 +214,13 @@ class _WaitResult(NamedTuple):
     done: set
     not_done: set
 
+_State = Enum('_State', ['UNATTACHED', 'ATTACHED', 'LOST'])
+_UNATTACHED = _State.UNATTACHED
+_ATTACHED = _State.ATTACHED
+_LOST = _State.LOST
+
 def wait(futures, timeout=None, return_when=ALL_COMPLETED):
-    gen = as_completed(not_done, timeout)
+    gen = as_completed(futures, timeout)
     done = set()
     for fut in gen:
         done.add(fut)
@@ -227,16 +234,85 @@ def debug_dict(o):
     else:
         return repr(o)
 
+class Connection:
+    def __init__(self, ctx, name, hostname):
+        self.state = _UNATTACHED
+        self.name = name
+        self.hostname = hostname
+        self.host = None
+        self.heartbeat()
+        if hostname is None:
+            self.abort(ctx, 'Connection did not start with a hostname')
+        else:
+            # let the connection know we exist
+            ctx._backend.send_multipart([name, b''])
+
+
+    def heartbeat(self):
+        self.expiry = time.time() + HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
+
+    def check_alive_at(self, ctx, t):
+        if self.state is not _LOST and self.expiry < t:
+            # host timeout
+            elapsed = t - self.expiry + HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
+            logger.warning("Host %s has not heartbeated in %s seconds, disconnecting it", self.name, elapsed)
+            self.lost(ctx, "Host did not heartbeat")
+
+    def handle_message(self, ctx, msg):
+        self.heartbeat()
+        if self.state is _LOST:
+            # got a message from a host that expired, but
+            # eventually came back to life
+            # At this point we've marked its processes as dead
+            # so we are going to tell it to abort so that it gets
+            # restarted and can become a new connection.
+            logger.info("Host %s that was lost reconnected, sending abort", self.name)
+            self.send_abort(ctx, 'Supervisor thought host timed out')
+            return
+
+        if not len(msg):
+            # heartbeat, respond with our own
+            ctx._backend.send_multipart([self.name, b''])
+            return
+
+        if self.state is _UNATTACHED:
+            logger.warning(f"Got message from host %s manager before it was attached.", self.name)
+            self.lost(ctx, 'Host manager sent messages before attached.')
+            return
+
+        cmd, proc_id, *args = pickle.loads(msg)
+        receiver = self.host if proc_id is None else self.host._proc_table.get(proc_id)
+        if receiver is None:
+            # messages from a process might arrive after the user
+            # no longer has a handle to the Process object
+            # in which case they are ok to just drop
+            assert proc_id >= 0 and proc_id < ctx._next_id, "unexpected proc_id"
+            logger.debug("Received message %s from process %s after local handle deleted", cmd, proc_id)
+        else:
+            getattr(receiver, cmd)(*args)
+
+    def lost(self, ctx, with_error):
+        orig_state = self.state
+        if orig_state is _LOST:
+            return
+        self.state = _LOST
+        if orig_state is _ATTACHED:
+            self.host._lost(with_error)
+            self.host = None
+        self.send_abort(ctx, with_error)
+
+    def send_abort(self, ctx, with_error):
+        ctx._backend.send_multipart([self.name, pickle.dumps(('abort', with_error))])
+
+
 class Host:
     def __init__(self, context):
         self._context = context
-        self.expiry = None
+        self._state = _UNATTACHED
         self._name = None
-        self._state = 'unconnected'
         self._deferred_sends = []
         self._proc_table = weakref.WeakValueDictionary()
         self._hostname_future = Future(context, 'hostname', None)
-        self._hostname_value = None
         self._on_connection_lost = Future(context, 'host_connection_lost', self._hostname_future)
 
     def __repr__(self):
@@ -245,46 +321,33 @@ class Host:
     def hostname(self):
         return self._hostname_future
 
-    def _set_hostname(self, hostname):
-        self._hostname_value = hostname # for event_handler thread use
-        self._hostname_future.set_result(hostname) # for client use
-
-    def _hostname(self, hostname):
-        self._set_hostname(hostname)
-        # let the host know we have received its connection
-        self._send(b'')
-
-    def _heartbeat(self):
-        self.expiry = time.time() + HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
-
-    def _connect(self, name):
-        self._context._name_to_host[name] = self
-        self._state = 'connected'
-        self._name = name
-        for msg in self._deferred_sends:
-            self._context._backend.send_multipart([self._name, msg])
+    def _lost(self, msg):
+        orig_state = self._state
+        if orig_state is _LOST:
+            return
+        self._state = _LOST
+        if orig_state is _ATTACHED:
+            self._context._name_to_connection[self._name].lost(self._context, msg)
+        self._name = None
         self._deferred_sends.clear()
-
-    def _disconnect(self):
-        self._state = 'lost'
         for p in self._proc_table.values():
             p._lost_host()
-
         # is there value in keeping this around for a reconnect?
         self._proc_table.clear()
         self._on_connection_lost.set_result(None)
+
 
     def _debug_dict(self):
         return self.__dict__
 
     def _send(self, msg):
-        if self._state == 'unconnected':
-            self._deferred_sends.append(msg)
-        else:
+        if self._state is _ATTACHED:
             self._context._backend.send_multipart([self._name, msg])
+        elif self._state is _UNATTACHED:
+            self._deferred_sends.append(msg)
 
     def _launch(self, p):
-        if self._state == "lost":
+        if self._state is _LOST:
             # launch after we lost connection to this host.
             p._lost_host()
             return
@@ -303,7 +366,7 @@ class ProcessFailedToStart(Exception):
 
 class Process:
     def __init__(self, context, host, rank, processes_per_host, world_size, popen, name, simulate):
-        _id = self._id = context._next_id
+        self._id = context._next_id
         context._next_id += 1
         self._context = context
         self.host = host
@@ -361,14 +424,13 @@ class Process:
             self.host._send(pickle.dumps(('signal', self._id, signal, group)))
 
     # return first response where filter(msg) is True
-    def recv(self, filter: callable=lambda x: True) -> 'Future[Any]':
-        _id = self._id
+    def recv(self, filter: Callable[[Any], bool]=lambda x: True) -> 'Future[Any]':
         hostname = self.host.hostname()
         fut = Future(self._context, f'{self.name}.recv()', hostname)
         self._context._schedule(lambda: self._recv(fut, filter))
         return fut
 
-    def _recv(self, fut: Future, filter: callable):
+    def _recv(self, fut: Future, filter: Callable[[Any], bool]):
         for i, msg in enumerate(self._messages):
             if filter(msg):
                 self._messages.pop(i)
@@ -407,6 +469,17 @@ class Process:
     def __del__(self):
         self._context._proc_deletes += 1
 
+def _check_for_hostname(msg):
+    if not len(msg):
+        return None
+    try:
+        cmd, _, hostname = pickle.loads(msg)
+        if cmd != '_hostname' or not isinstance(hostname, str):
+            return None
+        return hostname
+    except:
+        return None
+
 class Context:
     def __init__(self, port=55555, log_format=None):
         if log_format is not None:
@@ -440,7 +513,7 @@ class Context:
 
         self._unassigned_hosts = deque()
         self._unassigned_connections = deque()
-        self._name_to_host = {}
+        self._name_to_connection = {}
         self._last_heartbeat_check = time.time()
         self._next_id = 0
         self._exits = 0
@@ -455,6 +528,25 @@ class Context:
         self._thread = Thread(target=self._event_loop, daemon=True)
         self._thread.start()
 
+    def _attach(self):
+        while self._unassigned_connections and self._unassigned_hosts:
+            c = self._unassigned_connections[0]
+            h = self._unassigned_hosts[0]
+            if c.state is _LOST:
+                self._unassigned_connections.popleft()
+            elif h._state is _LOST:
+                self._unassigned_hosts.popleft()
+            else:
+                self._unassigned_connections.popleft()
+                self._unassigned_hosts.popleft()
+                c.host = h
+                h._name = c.name
+                h._hostname_future.set_result(c.hostname)
+                h._state = c.state = _ATTACHED
+                for msg in h._deferred_sends:
+                    self._backend.send_multipart([h._name, msg])
+                h._deferred_sends.clear()
+
     def _event_loop(self):
         _time_poll = 0
         _time_process = 0
@@ -465,45 +557,13 @@ class Context:
             for sock, _ in poll_result:
                 if sock is self._backend:
                     f, msg = self._backend.recv_multipart()
-                    if f not in self._name_to_host:
-                        # XXX: we should check that the thing connecting also
-                        # thinks it is new, otherwise it might have stale state
-                        if self._unassigned_hosts:
-                            host = self._unassigned_hosts.popleft()
-                        else:
-                            # TODO: unassigned connections and dead connections
-                            # should not be host objects, it is too easy to get them wrong.
-                            # instead, we should have a different object for dead connections
-                            # and connections that haven't been matched yet.
-                            host = Host(self)
-                            self._unassigned_connections.append(host)
-                        host._connect(f)
+                    if f not in self._name_to_connection:
+                        hostname = _check_for_hostname(msg)
+                        connection = self._name_to_connection[f] = Connection(self, f, hostname)
+                        self._unassigned_connections.append(connection)
+                        self._attach()
                     else:
-                        host = self._name_to_host[f]
-                    host._heartbeat()
-                    if host._state == 'lost':
-                        # got a message from a host that expired, but
-                        # eventually came back to life
-                        # At this point we've marked its processes as dead
-                        # so we are going to tell it to abort so that it gets
-                        # restarted and can become a new connection.
-                        logger.info("Host %s that was lost reconnected, sending abort", host._name)
-                        self._send_abort(host, 'Supervisor thought host timed out')
-                    elif len(msg):
-                        cmd, proc_id, *args = pickle.loads(msg)
-                        receiver = host if proc_id is None else host._proc_table.get(proc_id)
-                        if receiver is None:
-                            # messages from a process might arrive after the user
-                            # no longer has a handle to the Process object
-                            # in which case they are ok to just drop
-                            assert proc_id >= 0 and proc_id < self._next_id, "unexpected proc_id"
-                            logger.debug("Received message %s from process %s after local handle deleted", cmd, proc_id)
-                        else:
-                            getattr(receiver, cmd)(*args)
-                    else:
-                        # heartbeat, respond with our own
-                        host._send(b'')
-
+                        self._name_to_connection[f].handle_message(self, msg)
                 elif sock is self._requests_ready:
                     while self._requests:
                         self._requests_ready.recv()
@@ -519,11 +579,8 @@ class Context:
                 elapsed = t - self._last_heartbeat_check
                 self._last_heartbeat_check = t
                 # priority queue would be log(N)
-                for key, host in self._name_to_host.items():
-                    if host._state == 'connected' and host.expiry < t:
-                        # host timeout
-                        logger.warning("Host %s has not heartbeated in %s seconds, disconnecting it", host._name, elapsed)
-                        host._disconnect()
+                for connection in self._name_to_connection.values():
+                    connection.check_alive_at(self, t)
 
             # Marking futures ready should always happen at the end of processing events above
             # to unblock anything processing the futures, before we start waiting for more events.
@@ -542,11 +599,12 @@ class Context:
 
 
     def _logstatus(self, poll_fraction, active_fraction):
-        host_histogram = {}
-        for h in self._name_to_host.values():
-            host_histogram[h._state] = host_histogram.setdefault(h._state, 0) + 1
-        logger.info("supervisor status: %s process launches, %s exits, %s message sends, %s message responses, %s process __del__, %s host handles without hosts, %s connected hosts without handles, time is %.2f%% polling and %.2f%% active, hosts %s",
-         self._launches, self._exits, self._sends, self._responses, self._proc_deletes, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, host_histogram)
+        connection_histogram = {}
+        for connection in self._name_to_connection.values():
+            state = connection.state.name
+            connection_histogram[state] = connection_histogram.setdefault(state, 0) + 1
+        logger.info("supervisor status: %s process launches, %s exits, %s message sends, %s message responses, %s process __del__, %s hosts waiting for connections, %s connections waiting for handles, time is %.2f%% polling and %.2f%% active, connections %s",
+         self._launches, self._exits, self._sends, self._responses, self._proc_deletes, len(self._unassigned_hosts), len(self._unassigned_connections), poll_fraction*100, active_fraction*100, connection_histogram)
 
     def _debug_dict(self):
         return self.__dict__
@@ -555,10 +613,7 @@ class Context:
         self._requests.append(fn)
         self._doorbell.send(b'')
 
-    def _send_abort(self, host, with_error):
-        self._backend.send_multipart([host._name, pickle.dumps(('abort', with_error))])
-
-    def request_hosts(self, n: int) -> 'Future[List[Host]]':
+    def request_hosts(self, n: int) -> 'Tuple[Host, ...]':
         """
         Request from the scheduler n hosts to run processes on.
         The future is fulfilled when the reservation is made, but
@@ -568,48 +623,28 @@ class Context:
         will immediately full the future because the reservation was
         already made.
         """
-        f = Future(self, 'request_hosts', None)
         hosts = tuple(Host(self) for i in range(n))
-        f.set_result(hosts)
         self._schedule(lambda: self._request_hosts(hosts))
-        return f
-
-
-    def _next_connection(self):
-        while self._unassigned_connections:
-            host = self._unassigned_connections.popleft()
-            # its possible this connection timed out in the
-            # meantime
-            if host._state == 'connected':
-                return host
-        return None
+        return hosts
 
     def _request_host(self, h):
-        u = self._next_connection()
-        if u is None:
-            self._unassigned_hosts.append(h)
-        else:
-            h._connect(u._name)
-            h._set_hostname(u._hostname_value)
+        self._unassigned_hosts.append(h)
+        self._attach()
 
     def _request_hosts(self, hosts):
         for h in hosts:
             self._request_host(h)
 
-    def return_hosts(self, hosts: List[Host]):
+    def return_hosts(self, hosts: List[Host], error=None):
         """
         Processes on the returned hosts will be killed,
         and future processes launches with the host will fail.
         """
-        self._schedule(lambda: self._return_hosts(hosts))
+        self._schedule(lambda: self._return_hosts(hosts, error))
 
-    def _return_hosts(self, hosts: List[Host]):
+    def _return_hosts(self, hosts: List[Host], error):
         for h in hosts:
-            # XXX: this fails to return a host if it was
-            # not connected when it was returned.
-            if h._state == 'connected':
-                self._send_abort(h, None)
-                h._disconnect()
+            h._lost(error)
 
     def replace_hosts(self, hosts: List[Host]):
         """
@@ -622,24 +657,13 @@ class Context:
         # if the host is still connected, then send the host a message
         # then cancel is processes and abort with an error to get the
         # the scheduler to reassign the host
-        self._schedule(lambda: self._replace_hosts(hosts))
-
-    def _replace_hosts(self, hosts):
-        for h in hosts:
-            if h._state == 'connected':
-                self._send_abort(h, 'Supervisor replaced host')
-                h._disconnect()
-            # detach this host object from current name
-            old = Host(self)
-            old._connect(h._name)
-            old._disconnect()
-            h.__init__(self)
-            # let it get assigned to the next host to checkin
-            self._request_host(h)
+        self.return_hosts(hosts)
+        return self.request_hosts(len(hosts))
 
     def _shutdown(self):
         self._exit_event_loop = True
-        self._return_hosts(self._name_to_host.values())
+        for connection in self._name_to_connection.values():
+            connection.lost(self, None)
 
     def shutdown(self):
         self._schedule(self._shutdown)
@@ -650,7 +674,7 @@ class Context:
         self._context.term()
 
     # TODO: other arguments like environment, etc.
-    def create_process_group(self, hosts: List[Host], args, processes_per_host=1, env=None, cwd=None, name=None, simulate=False) -> List[Process]:
+    def create_process_group(self, hosts: List[Host], args, processes_per_host=1, env=None, cwd=None, name=None, simulate=False) -> Tuple[Process,...]:
         world_size = processes_per_host*len(hosts)
         if name is None:
             name = f'pg{self._pg_name}'
@@ -664,7 +688,7 @@ class Context:
         for p in procs:
             p.host._launch(p)
 
-    def _process_futures(self, timeout, remaining_futures_cb, ttl_report_interval=5) -> 'Generator[int]':
+    def _process_futures(self, timeout, remaining_futures_cb, ttl_report_interval=5) -> Iterable[int]:
         """
         Return a generator that completes futures. Yields the number of futures it has
         processed in each step, and will stop iterating when timeout is reached.
@@ -692,7 +716,7 @@ class Context:
         else:
             expiry = t + timeout
             while t < expiry:
-                if self._doorbell_poller.poll(timeout=1000*min(ttl_report_interval, expiry - t)):
+                if self._doorbell_poller.poll(timeout=int(1000*min(ttl_report_interval, expiry - t))):
                     yield read_futures()
                 elif ttl_report_interval < expiry - t:
                     s = io.StringIO()
