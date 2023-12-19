@@ -1,3 +1,4 @@
+# pyre-strict
 import zmq
 import sys
 import time
@@ -6,26 +7,24 @@ import io
 import traceback
 import pickle
 import subprocess
-from typing import NamedTuple, Any
+from typing import Mapping, Optional, Tuple, List, Dict
 import ctypes
 from supervisor import HEARTBEAT_INTERVAL, HEARTBEAT_LIVENESS, ProcessFailedToStart
 import signal
 import logging
 import socket
-from pathlib import Path
 from contextlib import nullcontext
 
 
-logger = logging.getLogger()
+logger: logging.Logger = logging.getLogger()
 ABORT_INTERVAL = 5
 __NR_pidfd_open = 434
 libc = ctypes.CDLL(None)
-syscall = libc.syscall
 
 
 # older libc do not have this syscall
-def pidfd_open(pid):
-    return syscall(__NR_pidfd_open, pid, 0)
+def pidfd_open(pid: int) -> int:
+    return libc.syscall(__NR_pidfd_open, pid, 0)
 
 
 # objects in this file represent Host/Process
@@ -38,20 +37,21 @@ def pidfd_open(pid):
 class Process:
     def __init__(
         self,
-        name,
-        logfilename,
-        proc_comm,
-        proc_id,
-        rank,
-        processes_per_host,
-        world_size,
-        popen,
-        proc_addr,
-    ):
+        name: str,
+        logfilename: Optional[str],
+        proc_comm: zmq.Socket,
+        proc_id: int,
+        rank: int,
+        processes_per_host: int,
+        world_size: int,
+        popen: Mapping[str, object],
+        proc_addr: str,
+    ) -> None:
         self.proc_id = proc_id
         self.proc_comm = proc_comm
         environ = dict(os.environ)
         if popen["env"] is not None:
+            # pyre-ignore
             environ.update(popen["env"])
         environ["RANK"] = str(rank)
         environ["WORLD_SIZE"] = str(world_size)
@@ -65,36 +65,41 @@ class Process:
                 nullcontext() if logfilename is None else open(logfilename, "a")
             )
             with logcontext as logfile:
-                self.subprocess = subprocess.Popen(
-                    **popen, start_new_session=True, stdout=logfile, stderr=logfile
+                self.subprocess: subprocess.Popen[str] = subprocess.Popen(
+                    # pyre-ignore
+                    **popen,
+                    start_new_session=True,
+                    stdout=logfile,
+                    stderr=logfile,
                 )
-        except Exception as e:
+        except Exception:
             s = io.StringIO()
             traceback.print_exc(file=s)
             logger.warn(f"Process failed to start: %s\n", s.getvalue())
             raise ProcessFailedToStart(s.getvalue())
-        self.fd = pidfd_open(self.subprocess.pid)
-        self.proc_id_bytes = proc_id.to_bytes(8, byteorder="little")
-        self.deferred_sends = []
+        self.fd: int = pidfd_open(self.subprocess.pid)
+        self.proc_id_bytes: bytes = proc_id.to_bytes(8, byteorder="little")
+        self.deferred_sends: Optional[List[bytes]] = []
 
-    def _send(self, msg):
+    def _send(self, msg: bytes) -> None:
         msg = pickle.dumps(msg)
         if self.deferred_sends is not None:
             self.deferred_sends.append(msg)
         else:
             self.proc_comm.send_multipart([self.proc_id_bytes, msg])
 
-    def _notify_connected(self):
-        if self.deferred_sends is not None:
-            for msg in self.deferred_sends:
+    def _notify_connected(self) -> None:
+        deferred_sends = self.deferred_sends
+        if deferred_sends is not None:
+            for msg in deferred_sends:
                 self.proc_comm.send_multipart([self.proc_id_bytes, msg])
             self.deferred_sends = None
 
 
 class Host:
-    def __init__(self, supervisor_port):
-        self.context = zmq.Context(1)
-        self.backend = self.context.socket(zmq.DEALER)
+    def __init__(self, supervisor_port: str) -> None:
+        self.context: zmq.Context = zmq.Context(1)
+        self.backend: zmq.Socket = self.context.socket(zmq.DEALER)
         self.backend.setsockopt(zmq.IPV6, True)
         logger.info("Host Manager Connecting to %s", supervisor_port)
         self.backend.connect(supervisor_port)
@@ -106,31 +111,31 @@ class Host:
         self.poller = zmq.Poller()
         self.poller.register(self.backend, zmq.POLLIN)
 
-        self.proc_comm = self.context.socket(zmq.ROUTER)
+        self.proc_comm: zmq.Socket = self.context.socket(zmq.ROUTER)
         self.proc_addr = f"ipc:///tmp/proc_{os.getpid()}"
         self.proc_comm.bind(self.proc_addr)
         self.poller.register(self.proc_comm, zmq.POLLIN)
 
-        self.process_table = {}
-        self.fd_to_pid = {}
+        self.process_table: Dict[bytes, Process] = {}
+        self.fd_to_pid: Dict[int, bytes] = {}
         self._launches = 0
 
-    def heartbeat(self):
+    def heartbeat(self) -> None:
         self.backend.send(b"")
 
     # TODO: validate these are valid messages to send
 
     def launch(
         self,
-        proc_id,
-        rank,
-        processes_per_rank,
-        world_size,
-        popen,
-        name,
-        simulate,
-        log_file,
-    ):
+        proc_id: int,
+        rank: int,
+        processes_per_rank: int,
+        world_size: int,
+        popen: Mapping[str, object],
+        name: str,
+        simulate: bool,
+        log_file: Optional[str],
+    ) -> None:
         self._launches += 1
         if simulate:
             self.backend.send(pickle.dumps(("_started", proc_id, 2)))
@@ -156,22 +161,22 @@ class Host:
             reply = str(e)
         self.backend.send(pickle.dumps(("_started", proc_id, reply)))
 
-    def send(self, proc_id, msg):
-        proc_id = proc_id.to_bytes(8, byteorder="little")
+    def send(self, _proc_id: int, msg: bytes) -> None:
+        proc_id = _proc_id.to_bytes(8, byteorder="little")
         if proc_id in self.process_table:
             process = self.process_table[proc_id]
             process._send(msg)
 
-    def signal(self, proc_id, sig, group):
-        proc_id = proc_id.to_bytes(8, byteorder="little")
+    def signal(self, _proc_id: int, sig: int, group: bool) -> None:
+        proc_id = _proc_id.to_bytes(8, byteorder="little")
         if proc_id in self.process_table:
             process = self.process_table[proc_id]
             if group:
                 os.killpg(process.subprocess.pid, sig)
             else:
-                process.send_signal(sig)
+                process.subprocess.send_signal(sig)
 
-    def _fd_exit(self, fd):
+    def _fd_exit(self, fd: int) -> Tuple[Process, int]:
         pid_bytes = self.fd_to_pid.pop(fd)
         process = self.process_table.pop(pid_bytes)
         # we do not allow descendents to outlive the parent
@@ -182,13 +187,13 @@ class Host:
         os.close(fd)
         return process, returncode
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         for proc in self.process_table.values():
             os.killpg(proc.subprocess.pid, signal.SIGTERM)
         expiry = time.time() + ABORT_INTERVAL
         ttl = ABORT_INTERVAL
         while ttl > 0 and self.process_table:
-            for s, _ in self.poller.poll(timeout=1000 * ttl):
+            for s, _ in self.poller.poll(timeout=int(1000 * ttl)):
                 if isinstance(s, int):
                     self._fd_exit(s)
             ttl = time.time() - expiry
@@ -196,18 +201,18 @@ class Host:
             for proc in self.process_table.values():
                 os.killpg(proc.subprocess.pid, signal.SIGKILL)
 
-    def abort(self, with_error=None):
+    def abort(self, with_error: Optional[str] = None) -> None:
         self.shutdown()
         if with_error:
             raise ConnectionAbortedError(with_error)
         else:
             sys.exit(0)
 
-    def run_event_loop_forever(self):
+    def run_event_loop_forever(self) -> None:
         heartbeat_at = time.time() + HEARTBEAT_INTERVAL
         expiry = None
         while True:
-            for s, _ in self.poller.poll(timeout=1000 * HEARTBEAT_INTERVAL):
+            for s, _ in self.poller.poll(timeout=int(1000 * HEARTBEAT_INTERVAL)):
                 if isinstance(s, int):
                     process, returncode = self._fd_exit(s)
                     self.backend.send(
@@ -243,13 +248,13 @@ class Host:
                     )
 
 
-def main(addr):
+def main(addr: str) -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO
     )
-    manager = Host(addr)
+    manager: Host = Host(addr)
 
-    def handler(signal, frame):
+    def handler(signal: int, frame: object) -> None:
         manager.shutdown()
         sys.exit(1)
 
