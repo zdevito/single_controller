@@ -193,8 +193,7 @@ class Future(Generic[T]):
 
         Should only be used by Executor implementations and unit tests.
         """
-        if self._complete:
-            raise ValueError("Future %s already completed", self)
+        assert not self._complete, f"Future {self} already completed"
         self._complete = True
         self._value = value
         self._was_exception = was_exception
