@@ -507,6 +507,11 @@ class SupervisorUnitTests(unittest.TestCase):
             self.assertEqual(socket0.recv(), b"")
             self.assertEqual("host0", h1.hostname().result(timeout=1))
 
+    def test_host_replace(self):
+        with context() as ctx:
+            b = ctx.request_hosts(2)
+            nh = ctx.replace_hosts(x for x in b)
+            self.assertEqual(len(b), len(nh))
 
 class SupervisorIntegrationTests(unittest.TestCase):
     def launch(

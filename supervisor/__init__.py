@@ -768,6 +768,7 @@ class Context:
         # if the host is still connected, then send the host a message
         # then cancel is processes and abort with an error to get the
         # the scheduler to reassign the host
+        hosts = list(hosts)
         self.return_hosts(hosts)
         return self.request_hosts(len(hosts))
 
