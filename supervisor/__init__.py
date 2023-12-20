@@ -391,7 +391,9 @@ class Host:
         if orig_state is _ATTACHED:
             self._context._name_to_connection[self._name].lost(self._context, msg)
         else:
-            self._hostname_future.set_exception(ConnectionAbortedError("Lost connection to process host"))
+            self._hostname_future.set_exception(
+                ConnectionAbortedError("Lost connection to process host")
+            )
         self._name = None
         self._deferred_sends.clear()
         for p in self._proc_table.values():
@@ -870,7 +872,9 @@ class Context:
                 yield read_futures()
 
 
-def get_message_queue(supervisor_ident: Optional[int]=None, supervisor_pipe: Optional[str]=None) -> zmq.Socket:
+def get_message_queue(
+    supervisor_ident: Optional[int] = None, supervisor_pipe: Optional[str] = None
+) -> zmq.Socket:
     """
     Processes launched on the hosts can use this function to connect
     to the messaging queue of the supervisor.
