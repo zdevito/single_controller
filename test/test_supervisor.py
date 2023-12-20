@@ -150,7 +150,7 @@ def emulate_mast_launch(args, N: int = 4):
                 h.kill()
 
 
-class TestSupervisor(unittest.TestCase):
+class SupervisorUnitTests(unittest.TestCase):
     def test_future(self):
         with context() as ctx:
 
@@ -507,56 +507,66 @@ class TestSupervisor(unittest.TestCase):
             self.assertEqual(socket0.recv(), b"")
             self.assertEqual("host0", h1.hostname().result(timeout=1))
 
-    def test_integration(self):
+
+class SupervisorIntegrationTests(unittest.TestCase):
+    def launch(
+        self,
+        health,
+        train,
+        expect,
+        N=4,
+        run_fraction=1,
+        rank_fraction=1,
+        connections=4,
+    ):
         test_name = Path(__file__).parent / "supervisor_integration.py"
+        config = {
+            "N": N,
+            "health": health,
+            "train": train,
+            "run_fraction": run_fraction,
+            "rank_fraction": rank_fraction,
+        }
+        result = emulate_mast_launch(
+            [sys.executable, test_name, "--supervise", repr(config)], connections
+        )
+        for e, r in zip(expect, result):
+            if e == ".":
+                self.assertEqual(r, 0)
+            else:
+                self.assertNotEqual(r, 0)
+        return result
 
-        def launch(
-            health,
-            train,
-            expect,
-            N=4,
-            run_fraction=1,
-            rank_fraction=1,
-            connections=4,
-        ):
-            config = {
-                "N": N,
-                "health": health,
-                "train": train,
-                "run_fraction": run_fraction,
-                "rank_fraction": rank_fraction,
-            }
-            result = emulate_mast_launch(
-                [sys.executable, test_name, "--supervise", repr(config)], connections
-            )
-            for e, r in zip(expect, result):
-                if e == ".":
-                    self.assertEqual(r, 0)
-                else:
-                    self.assertNotEqual(r, 0)
-            return result
+    def test_success(self):
+        self.launch(health=[[4, 3, 2, 1]], train=["........"], expect="....")
 
-        launch(health=[[4, 3, 2, 1]], train=["........"], expect="....")
-        launch(
+    def test_fail(self):
+        self.launch(
             health=[[4, 3, 2, 1], [4, 3, 2, 1]],
             train=["....F...", "........"],
             expect="....",
         )
-        launch(
+
+    def test_hang(self):
+        self.launch(
             health=[[4, 3, "hang", 1], [4, 3, 2, 1]],
             train=["......"],
             rank_fraction=0.75,
             run_fraction=0.75,
             expect="....",
         )
-        launch(
+
+    def test_error_fail(self):
+        self.launch(
             health=[[4, 3, 2, 1], [4, 3, 2, 1], [4, 3, 2, 1]],
             train=["...E..", "....F.", "......"],
             rank_fraction=0.75,
             run_fraction=0.75,
             expect="....",
         )
-        launch(
+
+    def test_error_error(self):
+        self.launch(
             health=[[4, 3, 2, 1], [4, 3, 2, 1], [4, 3, 2, 1]],
             train=["...E..", ".E....", "......"],
             rank_fraction=0.75,
