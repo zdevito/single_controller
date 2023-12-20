@@ -4,7 +4,6 @@ from unittest.mock import patch, Mock
 from contextlib import contextmanager
 import supervisor
 import time
-from queue import Queue
 import subprocess
 import zmq
 import os
@@ -15,6 +14,9 @@ import logging
 from socket import gethostname
 import signal
 import tempfile
+from pathlib import Path
+import sys
+import socket
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO
@@ -114,6 +116,24 @@ def host_sockets(N: int):
     finally:
         context.destroy(linger=500)
 
+def emulate_mast_launch(args, N: int = 4):
+    # for testing the mast launcher entrypoint
+    def create_host(i):
+        env = {**os.environ}
+        env['TW_TASK_ID'] = str(i)
+        env['MAST_HPC_TASK_GROUP_HOSTNAMES'] = socket.gethostname()
+        env['TORCH_ELASTIC_SUPERVISOR'] = str(i == 0)
+        env['MAST_HPC_TASK_GROUP_SIZE'] = str(N)
+        return subprocess.Popen(args, env=env)
+    hosts = [create_host(i) for i in range(N)]
+    expiry = time.time() + 10
+    try:
+        r = [h.wait(timeout=max(0, expiry - time.time())) for h in hosts]
+        return r
+    finally:
+        for h in hosts:
+            if h.poll() is None:
+                h.kill()
 
 class TestSupervisor(unittest.TestCase):
     def test_future(self):
@@ -404,7 +424,28 @@ class TestSupervisor(unittest.TestCase):
             self.assertEqual(socket0.recv(), b'')
             self.assertEqual('host0', h1.hostname().result(timeout=1))
 
-
+    def test_integration(self):
+        test_name = Path(__file__).parent / 'supervisor_integration.py'
+        def launch(health, train, expect, N=4, run_fraction=1, rank_fraction=1, connections=4, ):
+            config = {
+                'N': N,
+                'health': health,
+                'train': train,
+                'run_fraction': run_fraction,
+                'rank_fraction': rank_fraction
+            }
+            result = emulate_mast_launch([sys.executable, test_name, '--supervise', repr(config)], connections)
+            for e, r in zip(expect, result):
+                if e == '.':
+                    self.assertEqual(r, 0)
+                else:
+                    self.assertNotEqual(r, 0)
+            return result
+        launch(health=[[4, 3, 2, 1]],train = ["........"], expect = '....')
+        launch(health=[[4, 3, 2, 1], [4, 3, 2, 1]],train = ["....F...", "........"], expect = '....')
+        launch(health=[[4, 3, "hang", 1], [4, 3, 2, 1]], train = ["......"], rank_fraction=.75, run_fraction=.75, expect = '....')
+        launch(health=[[4, 3, 2, 1], [4, 3, 2, 1], [4, 3, 2, 1]], train = ["...E..", "....F.", "......"], rank_fraction=.75, run_fraction=.75, expect = '....')
+        launch(health=[[4, 3, 2, 1], [4, 3, 2, 1], [4, 3, 2, 1]], train = ["...E..", ".E....", "......"], rank_fraction=.75, run_fraction=.75, connections=5, expect = '....')
 
 if __name__ == '__main__':
     unittest.main()

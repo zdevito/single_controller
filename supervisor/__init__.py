@@ -301,8 +301,8 @@ class Connection:
             # host timeout
             elapsed = t - self.expiry + HEARTBEAT_INTERVAL * HEARTBEAT_LIVENESS
             logger.warning(
-                "Host %s has not heartbeated in %s seconds, disconnecting it",
-                self.name,
+                "Host %s (%s) has not heartbeated in %s seconds, disconnecting it",
+                self.hostname, self.name,
                 elapsed,
             )
             self.lost(ctx, "Host did not heartbeat")
@@ -654,7 +654,7 @@ class Context:
         _time_process = 0
         while True:
             time_begin = time.time()
-            poll_result = self._poller.poll(timeout=int(HEARTBEAT_INTERVAL * 1000 * 2))
+            poll_result = self._poller.poll(timeout=int(HEARTBEAT_INTERVAL * 1000))
             time_poll = time.time()
             for sock, _ in poll_result:
                 if sock is self._backend:
