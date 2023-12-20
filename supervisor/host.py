@@ -81,8 +81,8 @@ class Process:
         self.proc_id_bytes: bytes = proc_id.to_bytes(8, byteorder="little")
         self.deferred_sends: Optional[List[bytes]] = []
 
-    def _send(self, msg: bytes) -> None:
-        msg = pickle.dumps(msg)
+    def _send(self, _msg: object) -> None:
+        msg = pickle.dumps(_msg)
         if self.deferred_sends is not None:
             self.deferred_sends.append(msg)
         else:

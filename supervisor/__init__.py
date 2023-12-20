@@ -346,6 +346,7 @@ class Connection:
             )
         else:
             getattr(receiver, cmd)(*args)
+            receiver = None
 
     def lost(self, ctx: "Context", with_error: Optional[str]) -> None:
         orig_state = self.state
@@ -389,6 +390,8 @@ class Host:
         self._state = _LOST
         if orig_state is _ATTACHED:
             self._context._name_to_connection[self._name].lost(self._context, msg)
+        else:
+            self._hostname_future.set_exception(ConnectionAbortedError("Lost connection to process host"))
         self._name = None
         self._deferred_sends.clear()
         for p in self._proc_table.values():
