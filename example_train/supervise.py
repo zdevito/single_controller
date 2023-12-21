@@ -151,7 +151,7 @@ def train_with_size(ctx, hosts):
     return list(hosts)
 
 def main(N, port):
-    #ctx = Context(port=port, log_format='/tmp/dedicated_{name}.log')
+    # ctx = Context(port=port, log_format='/tmp/foo/bar/dedicated_{name}.log')
     ctx = Context(port=port)
     hosts: List[Host] = ctx.request_hosts(n=N)
 

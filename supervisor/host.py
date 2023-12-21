@@ -14,6 +14,7 @@ import signal
 import logging
 import socket
 from contextlib import nullcontext
+from pathlib import Path
 
 
 logger: logging.Logger = logging.getLogger()
@@ -61,9 +62,11 @@ class Process:
         environ["SUPERVISOR_IDENT"] = str(proc_id)
         popen = {**popen, "env": environ}
         try:
-            logcontext = (
-                nullcontext() if logfilename is None else open(logfilename, "a")
-            )
+            if logfilename is None:
+                logcontext = nullcontext()
+            else:
+                Path(logfilename).parent.mkdir(exist_ok=True, parents=True)
+                logcontext = open(logfilename, "a")
             with logcontext as logfile:
                 self.subprocess: subprocess.Popen[str] = subprocess.Popen(
                     # pyre-ignore

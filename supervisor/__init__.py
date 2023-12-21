@@ -585,6 +585,7 @@ class Context:
         if log_format is not None:
             path = log_format.format(name="supervisor")
             logger.info(f"Redirect logging to {path}")
+            Path(path).parent.mkdir(exist_ok=True, parents=True)
             with open(path, "w") as f:
                 os.dup2(f.fileno(), sys.stdout.fileno())
                 os.dup2(f.fileno(), sys.stderr.fileno())
