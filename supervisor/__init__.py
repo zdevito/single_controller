@@ -581,7 +581,7 @@ def _check_for_hostname(msg: bytes) -> Optional[str]:
 
 
 class Context:
-    def __init__(self, port: int = 55555, log_format: Optional[str] = None) -> None:
+    def __init__(self, port: int = 55555, log_format: Optional[str] = None, log_interval=10) -> None:
         if log_format is not None:
             path = log_format.format(name="supervisor")
             logger.info(f"Redirect logging to {path}")
@@ -589,7 +589,7 @@ class Context:
             with open(path, "w") as f:
                 os.dup2(f.fileno(), sys.stdout.fileno())
                 os.dup2(f.fileno(), sys.stderr.fileno())
-
+        self._log_interval = log_interval
         self._context: zmq.Context = zmq.Context(1)
 
         # to talk to python clients in this process
@@ -618,6 +618,7 @@ class Context:
         self._unassigned_connections: deque[Connection] = deque()
         self._name_to_connection: Dict[bytes, Connection] = {}
         self._last_heartbeat_check: float = time.time()
+        self._last_logstatus: float = self._last_heartbeat_check
         self._next_id = 0
         self._exits = 0
         self._sends = 0
@@ -697,7 +698,9 @@ class Context:
             _time_poll += time_poll - time_begin
             _time_process += time_end - time_poll
 
-            if should_check_heartbeat:
+            elapsed = t - self._last_logstatus
+            if elapsed > self._log_interval:
+                self._last_logstatus = t
                 self._logstatus(_time_poll / elapsed, _time_process / elapsed)
                 _time_poll = 0
                 _time_process = 0
