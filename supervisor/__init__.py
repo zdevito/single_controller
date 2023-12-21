@@ -463,15 +463,15 @@ class Process:
         self.world_size = world_size
         self.popen = popen
         self.simulate = simulate
-        self.name = f"{name}_rank{str(rank).zfill(len(str(world_size)))}"
+        self.name = name.format(rank=str(rank).zfill(len(str(world_size))))
         self.logfile: Optional[str] = (
             None
             if context._log_format is None
             else context._log_format.format(name=self.name)
         )
         hostname = self.host.hostname()
-        self._pid = Future[int](context, f"{self.name}.pid()", hostname)
-        self._returncode = Future[int](context, f"{self.name}.returncode()", hostname)
+        self._pid = Future[int](context, f"proc[{self.name!r}].pid()", hostname)
+        self._returncode = Future[int](context, f"proc[{self.name!r}].returncode()", hostname)
 
         self._recvs: List[Tuple[Callable[[object], bool], Future[object]]] = []
         self._messages: List[object] = []
@@ -524,7 +524,7 @@ class Process:
         self, filter: Callable[[object], bool] = lambda x: True
     ) -> "Future[object]":
         hostname = self.host.hostname()
-        fut = Future(self._context, f"{self.name}.recv()", hostname)
+        fut = Future(self._context, f"proc[{self.name!r}].recv()", hostname)
         self._context._schedule(lambda: self._recv(fut, filter))
         return fut
 
@@ -804,6 +804,7 @@ class Context:
         if name is None:
             name = f"pg{self._pg_name}"
             self._pg_name += 1
+        logger.info("Starting process group %r with %d processes (%s hosts * %s processes per host)", name, world_size, len(hosts), processes_per_host)
         popen = {"args": args, "env": env, "cwd": cwd}
         procs = tuple(
             Process(

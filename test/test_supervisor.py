@@ -365,7 +365,7 @@ class SupervisorUnitTests(unittest.TestCase):
                     1,
                     1,
                     {"args": ["test"], "env": None, "cwd": None},
-                    "pg0_rank0",
+                    "pg0",
                     False,
                     None,
                 )
@@ -401,7 +401,7 @@ class SupervisorUnitTests(unittest.TestCase):
                     1,
                     1,
                     {"args": ["test2"], "env": None, "cwd": None},
-                    "pg2_rank0",
+                    "pg2",
                     False,
                     None,
                 )
