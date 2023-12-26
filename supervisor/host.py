@@ -19,6 +19,7 @@ from pathlib import Path
 
 logger: logging.Logger = logging.getLogger()
 ABORT_INTERVAL = 5
+LOG_PSTREE_INTERVAL = 60*10
 __NR_pidfd_open = 434
 libc = ctypes.CDLL(None)
 
@@ -27,7 +28,28 @@ libc = ctypes.CDLL(None)
 def pidfd_open(pid: int) -> int:
     return libc.syscall(__NR_pidfd_open, pid, 0)
 
+def extract_pss(pid):
+    try:
+        with open(f'/proc/{pid}/smaps_rollup', 'r') as f:
+            for line in f.readlines():
+                if line.startswith('Pss:'):  # Check if the line starts with 'Pss:'
+                    return ' '.join(line.split()[1:3])
+    except:
+        pass
+    return None
 
+def log_pstree_output(pid):
+    pstree_output = subprocess.check_output(['pstree', '-Tap', str(pid)]).decode("utf-8")
+    lines = pstree_output.split('\n')
+    output = ["Process Info"]
+    for line in lines:
+        if not line.strip():
+            continue
+        parts = line.split(',')
+        pid = parts[1].split()[0]
+        mem = extract_pss(pid)
+        output.append(f"{line} {mem}")
+    logger.info('\n'.join(output))
 # objects in this file represent Host/Process
 # on the host machine itself.
 
@@ -215,8 +237,11 @@ class Host:
         else:
             sys.exit(0)
 
+
+
     def run_event_loop_forever(self) -> None:
         heartbeat_at = time.time() + HEARTBEAT_INTERVAL
+        log_pstree_info_at = time.time() + LOG_PSTREE_INTERVAL
         expiry = None
         while True:
             for s, _ in self.poller.poll(timeout=int(1000 * HEARTBEAT_INTERVAL)):
@@ -246,12 +271,16 @@ class Host:
             if expiry is not None:
                 t = time.time()
                 if t > heartbeat_at:
-                    heartbeat_at = time.time() + HEARTBEAT_INTERVAL
+                    heartbeat_at = t + HEARTBEAT_INTERVAL
                     self.heartbeat()
                 if t > expiry:
                     self.abort(
                         f"No messages from supervisor for {HEARTBEAT_INTERVAL*HEARTBEAT_LIVENESS} seconds, aborting."
                     )
+                if t > log_pstree_info_at:
+                    log_pstree_info_at = t + LOG_PSTREE_INTERVAL
+                    log_pstree_output(os.getpid())
+
 
 
 def main(addr: str) -> None:
