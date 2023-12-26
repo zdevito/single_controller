@@ -513,6 +513,10 @@ class SupervisorUnitTests(unittest.TestCase):
             nh = ctx.replace_hosts(x for x in b)
             self.assertEqual(len(b), len(nh))
 
+    def test_pstree(self):
+        from supervisor.host import log_pstree_output
+        log_pstree_output(os.getppid())
+
 class SupervisorIntegrationTests(unittest.TestCase):
     def launch(
         self,
