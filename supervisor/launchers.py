@@ -45,8 +45,7 @@ def mast(supervise):
         )
         result = host_process.wait()
         if result != 0:
-            # Until we can use HPC_TASK level restarts, workaround it,
-            # by not letting host machines report an error even when the machine fails.
             logger.info(
-                f"Host manager exited with non-zero code {result}, but we are exiting cleanly so the fleet wide job doesn't end."
+                f"Host manager exited with non-zero code {result}, raising error to get a new host."
             )
+            raise SystemExit(result)

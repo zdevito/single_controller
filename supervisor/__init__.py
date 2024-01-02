@@ -233,6 +233,9 @@ class as_completed:
         for f in futures:
             self.add(f)
 
+    def __len__(self) -> int:
+        return len(self._not_done)
+
     def __iter__(self) -> Iterator[Future[object]]:
         ctx = self._ctx
         if not ctx:
@@ -463,7 +466,7 @@ class Process:
         self.world_size = world_size
         self.popen = popen
         self.simulate = simulate
-        self.name = name.format(rank=str(rank).zfill(len(str(world_size))))
+        self.name: str = name.format(rank=str(rank).zfill(len(str(world_size))))
         self.logfile: Optional[str] = (
             None
             if context._log_format is None
@@ -581,7 +584,7 @@ def _check_for_hostname(msg: bytes) -> Optional[str]:
 
 
 class Context:
-    def __init__(self, port: int = 55555, log_format: Optional[str] = None, log_interval=10) -> None:
+    def __init__(self, port: int = 55555, log_format: Optional[str] = None, log_interval: float=10) -> None:
         if log_format is not None:
             path = log_format.format(name="supervisor")
             logger.info(f"Redirect logging to {path}")
@@ -589,7 +592,7 @@ class Context:
             with open(path, "w") as f:
                 os.dup2(f.fileno(), sys.stdout.fileno())
                 os.dup2(f.fileno(), sys.stderr.fileno())
-        self._log_interval = log_interval
+        self._log_interval: float = log_interval
         self._context: zmq.Context = zmq.Context(1)
 
         # to talk to python clients in this process
