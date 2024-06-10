@@ -5,7 +5,9 @@ from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
 from functools import partial
 from threading import Thread
-from controller.controller import Controller, ProcessBackend
+from controller.backend import ProcessBackend
+from controller.controller import Controller
+
 from controller import world_mesh, active_mesh
 import signal
 from time import sleep

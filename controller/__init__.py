@@ -11,8 +11,8 @@ from .tensor import Tensor, dtensor_check
 from .device_mesh import DeviceMesh, remote_function, active_mesh
 from .ndslice import NDSlice
 from . import stream, device_mesh
-from .controller import Controller as _Controller, ProcessBackend as _ProcessBackend
-
+from .controller import Controller as _Controller
+from .backend import ProcessBackend as _ProcessBackend
 def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: Optional[str] = None):
     """
     Retrieve the shard at `coordinates` of the current device mesh of each tensor in obj.
