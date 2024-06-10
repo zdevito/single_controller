@@ -1,4 +1,6 @@
 from typing import TYPE_CHECKING, Dict, Any, Union, Literal, Optional, List, Tuple
+
+from controller.ndslice import NDSlice
 from .tree import flatten, tree_map
 from .base_tensor import BaseTensor
 
@@ -162,7 +164,7 @@ class Tensor(Referenceable, BaseTensor):
         """
         if mesh is not None:
             raise NotImplementedError()
-        if dim not in self.mesh.dims:
+        if dim not in self.mesh.names:
             raise KeyError(f'dim {dim} not found in {self.mesh}')
         if reduction not in _valid_reduce.__args__:
             raise ValueError(f'reduction {reduction} not supported, reductions are {_valid_reduce.__args__}')
@@ -210,36 +212,42 @@ class MeshSliceTensor:
         self.slicing = slicing
 
     def to_mesh(self, mesh: 'DeviceMesh') -> 'Tensor':
-        if self.slicing.dims != mesh.dims:
-            raise ValueError(f'input of dimensions {self.slicing.dims} does not match destination mesh of dimensions {mesh.dims}')
+        sizes = []
+        strides = []
+        for name, size in zip(mesh.names, mesh.processes.sizes):
+            if name not in self.slicing.names:
+                # TODO: allow broadcasting, and remove this check
+                raise ValueError(f'dimension {name} is missing from destination device_mesh')
+            index = self.slicing.names.index(name)
+            if self.slicing.processes.sizes[index] != size:
+                raise ValueError(f'dimension {name} of destination device_mesh has a different length than the source tensor')
+            sizes.append(size)
+            strides.append(self.slicing.processes.strides[index])
 
-        # XXX - this is a very ineffiecient algorithm for figuring out which groups need messages. With O(Workers)
-        # individual sends. The message size is also O(Workers).
-        # An O(Workers) algorithm can easily send O(1) individual messages
-        # but this is suppose to be a stub for an optimized algorithm where:
+        if len(sizes) != len(self.slicing.names):
+            missing = set(self.slicing.names) - set(mesh.names)
+            raise ValueError(f'destination mesh does not have dimensions {missing}')
+
+        # Optimized algorithm where:
         # 1. We can represent submeshes as NDSlice(offet, sizes, strides) on rank.
         # 2. A message can be efficiently broadcast to List[NDSlice] ranks by a smart tree based algorithm that can
         #    figure out which subtrees need the message.
-        # 3. The message itself will use List[NDSlice] objects to express the send/recv set and so it is very small
+        # 3. The message itself will uses List[NDSlice] objects to express the send/recv set and so it is very small
 
         # so basically both the way the messsage is broadcast and its size will be compressed but the
         # send pattern and the meaning of the message will be the same as this ineffiecient form
 
-        combined_processes = self.slicing.processes
-        if self.slicing.processes is not mesh.processes:
-            combined_processes = sorted(set(self.slicing.processes).union(mesh.processes))
-
-        from_ranks = self.slicing.processes
+        from_ranks = NDSlice(self.slicing.processes.offset, sizes, strides)
         to_ranks = mesh.processes
         r = Tensor(self.tensor._fake, mesh, stream._active, False)
         assert r.ref is not None
-        self.tensor.mesh.ctrl.send(combined_processes, messages.SendTensor(r, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
+        self.tensor.mesh.ctrl.send([from_ranks, to_ranks], messages.SendTensor(r, from_ranks, to_ranks, self.tensor, self.tensor._factory(), self.tensor.stream))
         self.tensor.mesh.ctrl.history.invocation((r,), (self.tensor,))
         return r
 
-def _fake_reduce(tensor, source_mesh, dim, reduction, scatter):
+def _fake_reduce(tensor, source_mesh: 'DeviceMesh', dim: 'str', reduction, scatter: bool):
     if scatter:
-        N = source_mesh.dims[dim]
+        N = source_mesh.processes.sizes[source_mesh.names.index(dim)]
         if tensor.ndim == 0 or tensor.size(0) != N:
             raise TypeError(f'When scattering results the outer most dimension of tensor ({list(tensor.size())} must match the size ({N}) of the dimension "{dim}" being reduced')
         if reduction == 'stack':
@@ -249,7 +257,8 @@ def _fake_reduce(tensor, source_mesh, dim, reduction, scatter):
         return tensor.sum(dim=0)
     else:
         if reduction == 'stack':
-            return torch.empty([source_mesh.dims[dim], *tensor.shape],
+            N = source_mesh.processes.sizes[source_mesh.names.index(dim)]
+            return torch.empty([N, *tensor.shape],
                                dtype=tensor.dtype, device=tensor.device, layout=tensor.layout)
         return tensor.add(tensor)
 

@@ -9,6 +9,7 @@ from . import messages
 from .reference import Referenceable
 from . import stream
 from .tensor import dtensor_dispatch
+from .ndslice import NDSlice
 import itertools
 
 if TYPE_CHECKING:
@@ -18,22 +19,22 @@ def remote_function(path: str):
     return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active, stream._active, func)
 
 class DeviceMesh(Referenceable):
-    def __init__(self, ctrl: 'Controller', processes: List[int], dims):
+    def __init__(self, ctrl: 'Controller', processes: 'NDSlice', names: Tuple[str, ...]):
+        assert isinstance(processes, NDSlice)
         self.ctrl = ctrl
-        assert isinstance(processes, list)
-        assert len(processes) == math.prod(dims.values())
-        self.dims: Dict[str, int] = dims
+        assert processes.ndim == len(names)
+        self.names = names
         self.processes = processes
         self.ref = None
 
     def __repr__(self):
-        return f'<DeviceMesh({tuple(self.dims.keys())}, {tuple(self.dims.values())}) at {hex(id(self))}>'
+        return f'<DeviceMesh({self.names}, {self.processes.sizes}) at {hex(id(self))}>'
 
     def define_ref(self):
         # Optimize: we do not have to send device meshes to all workers if we can
         # Create process groups as subsets
         self.ref = self.ctrl.ref()
-        msg = messages.CreateDeviceMesh(self, self.dims, self.processes)
+        msg = messages.CreateDeviceMesh(self, self.names, self.processes)
         self._send(msg, flush_deletes=False)
 
     def delete_ref(self, ref: int):
@@ -55,32 +56,33 @@ class DeviceMesh(Referenceable):
         """
         m.index(batch=3) or m.index(batch=slice(3, None))
         """
-        ranges = []
-        stride = 1
-        offset = 0
-        dims = {}
-        sizes = list(self.dims.values())
-        for i, (k, v) in enumerate(self.dims.items()):
-            stride = math.prod(sizes[i+1:])
-            if k in kwargs:
-                e = kwargs.pop(k)
+        offset = self.processes.offset
+        names = []
+        sizes = []
+        strides = []
+        for name, size, stride in zip(self.names, self.processes.sizes, self.processes.strides):
+            if name in kwargs:
+                e = kwargs.pop(name)
                 if isinstance(e, slice):
-                    the_range = range(*e.indices(v))
-                    dims[k] = len(the_range)
-                    ranges.append(stride*x for x in the_range)
+                    start, stop, slice_stride = e.indices(size)
+                    offset += start * stride
+                    names.append(name)
+                    sizes.append((stop - start) // slice_stride)
+                    strides.append(slice_stride * stride)
                 else:
-                    if e >= v or e < 0:
+                    if e >= size or e < 0:
                         raise IndexError('index out of range')
-                    offset += e*stride
+                    offset += e * stride
             else:
-                dims[k] = v
-                ranges.append(range(0, v*stride, stride))
+                names.append(name)
+                sizes.append(size)
+                strides.append(stride)
+
         if kwargs:
             raise TypeError(f'{self} does not have dimension(s) named {tuple(kwargs.keys())}')
 
-        indices = [offset + sum(x) for x in itertools.product(*ranges)]
-        processes = [self.processes[x] for x in indices]
-        return DeviceMesh(self.ctrl, processes, dims)
+        processes = NDSlice(offset, sizes, strides)
+        return DeviceMesh(self.ctrl, processes, tuple(names))
 
     def split(self, **kwargs: Dict[str, Tuple[str, ...]]):
         raise NotImplementedError()
@@ -90,27 +92,18 @@ class DeviceMesh(Referenceable):
 
     @remote_function('controller.worker._rank')
     def rank(self, dim: str):
-        if dim not in self.dims:
+        if dim not in self.names:
             raise KeyError(f'{self} does not have dimension {repr(dim)}')
         return torch.full((), 0, dtype=torch.long)
 
-    def _process(self, coordinates: Optional[Dict[str, int]]):
+    def _process(self, coordinates: Optional[Dict[str, int]]) -> NDSlice:
         if coordinates is None:
-            return self.processes[0]
-        stride = 1
-        offset = 0
-        extra = set(coordinates.keys()) - set(self.dims.keys())
-        if extra:
+            return NDSlice(self.processes.offset, [1], [1])
+        if len(coordinates) > len(self.names):
+            extra = set(coordinates.keys()) - set(self.names)
             raise KeyError(f'{list(extra)}')
-        for dim, size in reversed(self.dims.items()):
-            idx = coordinates[dim]
-            if idx < 0:
-                idx += size
-            if idx < 0 or idx >= size:
-                raise IndexError(f'{dim} of size {size} has index {idx} out of range')
-            offset += stride*idx
-            stride *= size
-        return self.processes[offset]
+        flat = [coordinates[name] for name in self.names]
+        return NDSlice(self.processes.nditem(flat), [1], [1])
 
     def _use(self, tensor):
         borrows = tensor._borrows

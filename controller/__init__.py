@@ -9,6 +9,7 @@ from .stream import active_stream, Stream
 from .future import Future
 from .tensor import Tensor, dtensor_check
 from .device_mesh import DeviceMesh, remote_function, active_mesh
+from .ndslice import NDSlice
 from . import stream, device_mesh
 from .controller import Controller as _Controller, ProcessBackend as _ProcessBackend
 
@@ -29,7 +30,7 @@ def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: O
     fut = Future(ctrl)
     ident = ctrl.history.ident((), tensors, fut)
     process = mesh._process(coordinates)
-    ctrl.send([process], messages.FetchValue(ident, preprocess, obj, stream._active))
+    ctrl.send(process, messages.FetchValue(ident, preprocess, obj, stream._active))
     return fut
 
 
@@ -52,7 +53,7 @@ class Pipe:
 def world_mesh(ctx: Context, hosts: List[Host], gpu_per_host: int, _processes=None):
     backend = _ProcessBackend(ctx, hosts, gpu_per_host, _processes=_processes)
     ctrl = _Controller(backend)
-    return DeviceMesh(ctrl, list(ctrl.all_ranks), {'host': len(hosts), 'gpu': gpu_per_host})
+    return DeviceMesh(ctrl, NDSlice(0, [len(hosts), gpu_per_host], [gpu_per_host, 1]), ('host', 'gpu'))
 
 def get_active_stream():
     return stream._active

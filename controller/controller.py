@@ -1,5 +1,5 @@
 from supervisor import Context, Host, FunctionCall, TTL, Process
-from typing import Dict, Optional, List, Sequence, NamedTuple, Tuple
+from typing import Dict, Optional, List, Sequence, NamedTuple, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor
 from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -11,6 +11,7 @@ from .history import History, RemoteException
 from .borrows import Borrows
 from .stream import Stream
 from .device_mesh import DeviceMesh
+from .ndslice import NDSlice
 
 from collections import defaultdict
 import itertools
@@ -42,7 +43,7 @@ _CONTROLLER_STATUS_INTERVAL = 2
 
 class Backend(ABC):
     @abstractmethod
-    def send(self, ranks: Sequence[int], msg) -> None:
+    def send(self, ranks: Union[NDSlice, List[NDSlice]], msg) -> None:
         raise NotImplementedError()
     
     @abstractmethod
@@ -70,9 +71,19 @@ class ProcessBackend(Backend):
     def world_size(self):
         return len(self.all_processes)
 
-    def send(self, ranks: Sequence[int], msg) -> None:
-        for rank in ranks:
-            self.all_processes[rank].send(msg)
+    def send(self, ranks: Union[NDSlice, List[NDSlice]], msg) -> None:
+        # the intent is for this to be optimized as tree broadcast
+        # base on if members of tree nodes overlap with a slice.
+        if isinstance(ranks, NDSlice):
+            for rank in ranks:
+                self.all_processes[rank].send(msg)
+        else:
+            sent = set()
+            for slice in ranks:
+                for rank in slice:
+                    if rank not in sent:
+                        self.all_processes[rank].send(msg)
+                        sent.add(rank)
 
     def recvready(self, timeout: Optional[float]) -> Sequence[Tuple[int, NamedTuple]]:
         result = []
@@ -135,12 +146,12 @@ class Controller:
                 return func(*args, **kwargs)
         return self.fake_mode_worker.submit(work).result()
 
-    def send(self, ranks: Sequence[int], msg: NamedTuple):
+    def send(self, ranks: Union[NDSlice, List[NDSlice]], msg: NamedTuple):
         self.backend.send(ranks, msg)
 
     @property
     def all_ranks(self):
-        return range(self.backend.world_size)
+        return NDSlice(0, [self.backend.world_size], [1])
 
     def shutdown(self):
         self._shutdown = True

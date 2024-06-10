@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from controller.ndslice import NDSlice
 from supervisor import LocalMessageQueue, get_message_queue, TTL
 from supervisor.logging import initialize_logging
 from typing import Dict, NamedTuple, Any, Union, Optional, List, Tuple, Callable
@@ -24,21 +25,15 @@ class Dim(NamedTuple):
     process_group: Any
 
 class DeviceMesh:
-    def __init__(self, dims: Dict[str, int], ranks: List[int], index: int):
+    def __init__(self, names: Tuple[str, ...], ranks: NDSlice, rank: int):
         self.dims = {}
-        stride = 1
-        initial_index = index
-        objects = []
-        for size in reversed(dims.values()):
-            rank = index % size
-            index //= size
-            group_start = initial_index - rank*stride
-            members = ranks[group_start:group_start+stride*size:stride]
-            assert members[rank] == ranks[initial_index]
+        coordinates = ranks.coordinates(rank)
+        for coordinate, name, size, stride in zip(coordinates, names, ranks.sizes, ranks.strides):
+            start = rank - stride*coordinate
+            members = [*range(start, start + stride*size, stride)]
+            assert members[coordinate] == rank
             process_group = torch.distributed.new_group(members, use_local_synchronization=True)
-            objects.append(Dim(rank, size, process_group))
-            stride *= size
-        self.dims = dict(zip(dims.keys(), reversed(objects)))
+            self.dims[name] = Dim(coordinate, size, process_group)
 
 def _rank(mesh: 'DeviceMesh', dim: str):
     return torch.full((), mesh.dims[dim].rank, dtype=torch.long)
@@ -117,9 +112,8 @@ class Worker:
             return fn(*event)
         raise RuntimeError(f"unhandled event: {event}")
 
-    def CreateDeviceMesh(self, result: 'Ref', dims: Dict[str, int], ranks: List[int]):
-        index = ranks.index(self.rank)
-        self.define(result, DeviceMesh(dims, ranks, index))
+    def CreateDeviceMesh(self, result: 'Ref', names: Tuple[str, ...], ranks: NDSlice):
+        self.define(result, DeviceMesh(names, ranks, self.rank))
 
     def lookup(self, a: Any):
         if isinstance(a, Ref):
@@ -275,7 +269,7 @@ class Worker:
             output = self._reduce(local_tensor, source_mesh, dim, reduction, scatter, inplace)
             self.define(result, output)
 
-    def SendTensor(self, result: Ref, from_ranks: List[int], to_ranks: List[int], tensorref: Ref, factory: TensorFactory, streamref):
+    def SendTensor(self, result: Ref, from_ranks: NDSlice, to_ranks: NDSlice, tensorref: Ref, factory: TensorFactory, streamref):
         try:
             stream = self.lookup(streamref)
         except DependentOnError as e:

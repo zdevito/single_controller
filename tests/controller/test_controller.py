@@ -76,16 +76,18 @@ class TestController(TestCase):
                     x.add(y)
 
     def test_mesh_index(self):
-        fake_processes = list(range(0, 2*3*4))
-        dm = DeviceMesh(None, fake_processes, {'a': 2, 'b': 3, 'c': 4})
+        fake_processes = NDSlice(0, [2, 3, 4], [12, 4, 1])
+        dm = DeviceMesh(None, fake_processes, ('a', 'b', 'c'))
         self.assertEqual(0, dm(a=0, b=0, c=0).processes[0])
         x = dm(a=0, b=0)
-        self.assertEqual(x.processes, fake_processes[0:4])
-        self.assertEqual(x.dims, {'c': 4})
+        print(x.processes, x.names)
+        self.assertEqual(x.processes[:], fake_processes[0:4])
+        self.assertEqual(x.names, ('c',))
+        self.assertEqual(x.processes.sizes[0], 4)
         x = dm(c=slice(None, None, 2))
-        self.assertEqual(x.processes, fake_processes[::2])
+        self.assertEqual(x.processes[:], fake_processes[::2])
         x = dm(b=2, c=3)
-        self.assertEqual(x.processes, [11, 23])
+        self.assertEqual(x.processes[:], (11, 23))
 
     def test_sub_mesh(self):
         with self.local_device_mesh(2, 2) as device_mesh:
@@ -117,7 +119,8 @@ class TestController(TestCase):
     @patch('torch.distributed.new_group', new=lambda ranks, use_local_synchronization: ranks)
     def test_worker_mesh_init(self):
         from controller.worker import DeviceMesh as WorkerDeviceMesh
-        wdm = WorkerDeviceMesh({'a': 3, 'b': 4}, ranks=list(range(3*4)), index=1)
+        processes = NDSlice(0, [3, 4], [4, 1])
+        wdm = WorkerDeviceMesh(('a', 'b'), processes, rank=1)
         a, b = wdm.dims['a'], wdm.dims['b']
         self.assertEqual(b.process_group, [0, 1, 2, 3])
         self.assertEqual(b.rank, 1)
@@ -125,15 +128,15 @@ class TestController(TestCase):
         self.assertEqual(a.process_group, [1, 5, 9])
         self.assertEqual(a.rank, 0)
 
-
-        wdm = WorkerDeviceMesh({'a': 3, 'b': 4}, ranks=list(range(3*4)), index=6)
+        wdm = WorkerDeviceMesh(('a', 'b'), processes, rank=6)
         a, b = wdm.dims['a'], wdm.dims['b']
         self.assertEqual(b.process_group, [4, 5, 6, 7])
         self.assertEqual(b.rank, 2)
         self.assertEqual(a.process_group, [2, 6, 10])
         self.assertEqual(a.rank, 1)
 
-        wdm = WorkerDeviceMesh({'a': 3, 'b': 4, 'c': 2}, ranks=list(range(3*4*2)), index=10)
+        processes = NDSlice(0, [3, 4, 2],  [8, 2, 1])
+        wdm = WorkerDeviceMesh(('a', 'b', 'c'), processes, rank=10)
         print(wdm.dims)
 
     def test_reduce(self):

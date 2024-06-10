@@ -1,6 +1,8 @@
 from typing import TYPE_CHECKING, Dict, NamedTuple, Any, Union, Optional, List, Tuple, Callable
 from traceback import FrameSummary
 from .tensor_factory import TensorFactory
+from .ndslice import NDSlice
+
 if TYPE_CHECKING:
     from .stream import Stream
     from .tensor import Tensor
@@ -8,8 +10,8 @@ if TYPE_CHECKING:
 
 class CreateDeviceMesh(NamedTuple):
     result: 'DeviceMesh'
-    dims: Dict[str, int]
-    ranks: List[int]
+    names: Tuple[str, ...]
+    ranks: 'NDSlice'
 
 class CreateStream(NamedTuple):
     result: 'Stream'
@@ -75,8 +77,8 @@ class BorrowFirstUse(NamedTuple):
 
 class SendTensor(NamedTuple):
     result: 'Tensor'
-    from_ranks: List[int]
-    to_ranks: List[int]
+    from_ranks: NDSlice
+    to_ranks: NDSlice
     tensor: 'Tensor'
     factory: 'TensorFactory'
     stream: 'Stream'
