@@ -1,7 +1,6 @@
 from supervisor import Context, Host, FunctionCall, TTL, Process
 from typing import Optional, List, Sequence, NamedTuple, Tuple, Union
 import torch
-
 from torch.distributed import TCPStore
 from .ndslice import NDSlice
 from collections import deque
@@ -131,14 +130,11 @@ class MockBackend(Backend):
         print(ranks, msg)
 
     def recvready(self, timeout: Optional[float]) -> Sequence[Tuple[int, NamedTuple]]:
-        if self.responses:
-            print(self.responses)
         r = tuple(self.responses)
         self.responses.clear()
         return r
 
     def recv(self, timeout: Optional[float]) -> Tuple[int, NamedTuple]:
         if self.responses:
-            print(self.responses)
             return self.responses.popleft()
         raise TimeoutError()
