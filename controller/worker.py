@@ -11,6 +11,7 @@ import torch
 import torch.distributed
 from traceback import extract_tb
 from . import messages
+from .messages import RemoteFunction
 from .tensor_factory import TensorFactory
 from .reference import Ref
 
@@ -23,6 +24,7 @@ class Dim(NamedTuple):
     rank: int
     size: int
     process_group: Any
+
 
 class DeviceMesh:
     def __init__(self, names: Tuple[str, ...], ranks: NDSlice, rank: int):
@@ -123,25 +125,11 @@ class Worker:
             return r
         return a
 
-    def _resolve_function(self, function_str: str) -> Callable:
-        first, *parts = function_str.split('.')
-        if first == 'torch':
-            function = globals()[first]
-            for p in parts:
-                function = getattr(function, p)
-            assert isinstance(function, Callable)
-        else:
-            modulename, funcname = function_str.rsplit('.', 1)
-            module = importlib.import_module(modulename)
-            function = getattr(module, funcname)
-        return function
-
-    def CallFunction(self, ident: int, results: Tuple[Ref], mutates: Tuple[Ref], function: Union[str, Callable], args: Tuple[Any, ...], kwargs: Dict[str, Any], streamref: Ref):
+    def CallFunction(self, ident: int, results: Tuple[Ref], mutates: Tuple[Ref], rfunction: RemoteFunction, args: Tuple[Any, ...], kwargs: Dict[str, Any], streamref: Ref):
         with self.try_define(ident, results + mutates):
             stream: Stream = self.lookup(streamref)
             args, kwargs = tree_map(self.lookup, (args, kwargs))
-            if isinstance(function, str):
-                function = self._resolve_function(function)
+            function = rfunction.resolve()
             with stream.enable():
                 result = function(*args, **kwargs)
             tensors, _ = flatten(result, lambda x: isinstance(x, torch.Tensor))
@@ -170,13 +158,13 @@ class Worker:
             self.q.send(messages.RemoteFunctionFailed(ident, e, extract_tb(e.__traceback__)))
         self.first_uncompleted_ident = ident + 1      
 
-    def FetchValue(self, ident: int, function_str: Optional[str], obj: Any, streamref: Ref):
-        with self.try_define(ident, ()):
+    def FetchValue(self, ident: int, mutates: Tuple[Ref], rfunction: Optional[RemoteFunction], obj: Any, streamref: Ref):
+        with self.try_define(ident, mutates):
             stream: Stream = self.lookup(streamref)
             obj = tree_map(self.lookup, obj)
             with stream.enable():
-                if function_str is not None:
-                    function = self._resolve_function(function_str)
+                if rfunction is not None:
+                    function = rfunction.resolve()
                     obj = function(obj)
                 self.q.send(messages.FetchResult(ident, obj))
 

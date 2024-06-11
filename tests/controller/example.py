@@ -1,10 +1,15 @@
 from controller import DeviceMesh, active_mesh, active_stream, Stream, fetch_shard, Future, Stream, get_active_stream
 import torch
 # this function helps get a local device mesh for testing
-from controller._testing import example_mesh
+from controller._testing import example_mesh, mock_mesh
 from controller.device_mesh import remote_function
 
-device_mesh = example_mesh(hosts=2, gpus=2)
+mocked = False
+if mocked:
+    device_mesh = mock_mesh(hosts=2, gpus=2)
+else:
+    device_mesh = example_mesh(hosts=2, gpus=2)
+
 
 # device meshes initially describe the hardware that 
 # the job will use
@@ -28,6 +33,10 @@ device_mesh.activate()
 @remote_function('controller._testing.log')
 def log(*args, **kwargs):
     None
+
+@remote_function('controller._testing.has_nan')
+def has_nan(t):
+    return False
 
 # run on workers
 log("my tensor: %s", t)
@@ -87,7 +96,7 @@ with active_mesh(None):
 
 # you don't always want tensor though, so you can pre
 # process the value before sending it:
-l = fetch_shard(reduce_scatter, dict(host=1, gpu=0), 'controller._testing.has_nan')
+l = fetch_shard(reduce_scatter, dict(host=1, gpu=0), has_nan)
 print(l.result())
 
 

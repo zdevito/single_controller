@@ -33,6 +33,9 @@ class Invocation:
         self.fut: Optional['Future'] = None
         self.fut_value: Any = None
 
+    def __repr__(self):
+        return f'<Invocation {self.fut}>'
+
     def fail(self, remote_exception: RemoteException):
         if self.failure is None or self.failure.ident > remote_exception.ident:
             self.failure = remote_exception
@@ -82,7 +85,7 @@ class History:
         self.first_uncompleted_ident[rank] = first_uncompleted_ident
         if prev == self.min_first_uncompleted_ident:
             self.min_first_uncompleted_ident = min(self.first_uncompleted_ident)
-            for _ in range(self.min_first_uncompleted_ident - prev):
+            for i in range(self.min_first_uncompleted_ident - prev):
                 invocation = self.invocations.popleft()
                 if invocation.fut is not None:
                     invocation.fut._set_result(invocation.fut_value if invocation.failure is None else invocation.failure)

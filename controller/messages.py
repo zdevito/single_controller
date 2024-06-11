@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Dict, NamedTuple, Any, Union, Optional, List, 
 from traceback import FrameSummary
 from .tensor_factory import TensorFactory
 from .ndslice import NDSlice
+import importlib
 
 if TYPE_CHECKING:
     from .stream import Stream
@@ -21,7 +22,7 @@ class CallFunction(NamedTuple):
     ident: int
     results: Tuple['Tensor', ...]
     mutates: Tuple['Tensor', ...]
-    function: Union[str, Callable]
+    function: 'RemoteFunction'
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
     stream: 'Stream'
@@ -40,7 +41,8 @@ class Restarted(NamedTuple):
 
 class FetchValue(NamedTuple):
     ident: int
-    function: Optional[str]
+    mutates: Tuple['Tensor', ...]
+    function: Optional['RemoteFunction']
     object: Any
     stream: 'Stream'
 
@@ -93,3 +95,24 @@ class Reduce(NamedTuple):
     reduction: str
     scatter: bool
     inplace: bool
+
+# not a direct message but used for remote functions that
+# are parts of messages
+class RemoteFunction(NamedTuple):
+    path: Union[str, Callable]
+
+    def resolve(self):
+        if isinstance(self.path, str):
+            first, *parts = self.path.split('.')
+            if first == 'torch':
+                function = importlib.import_module('torch')
+                for p in parts:
+                    function = getattr(function, p)
+                assert isinstance(function, Callable)
+            else:
+                modulename, funcname = self.path.rsplit('.', 1)
+                module = importlib.import_module(modulename)
+                function = getattr(module, funcname)
+            return function
+        else:
+            return self.path

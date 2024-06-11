@@ -13,12 +13,14 @@ from .borrows import Borrows
 from .stream import Stream
 from . import stream
 from supervisor import ProcessList
+from .fake import fake_call
 
 import traceback
 import warnings
 
 if TYPE_CHECKING:
-    from .device_mesh import DeviceMesh
+    from .device_mesh import DeviceMesh, RemoteFunction
+    from .future import Future
 
 _valid_reduce = Literal['stack', 'sum', 'avg', 'product', 'min', 'max', 'band', 'bor', 'bxor']
 
@@ -56,13 +58,13 @@ class Tensor(Referenceable, BaseTensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        return dtensor_dispatch(func, args, kwargs, None, stream._active, func)
+        return dtensor_dispatch(RemoteFunction(func, func), args, kwargs, None, stream._active)
 
     def __init__(self, fake: torch.Tensor, mesh: 'DeviceMesh', stream: Stream, borrowed: bool):
         pass
 
     def __repr__(self, *, tensor_contents=None):
-        return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._fake})"
+        return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._factory()})"
 
     def drop(self):
         if self.ref is None:
@@ -174,7 +176,7 @@ class Tensor(Referenceable, BaseTensor):
         if _inplace:
             fake_output = self._fake
         else:
-            fake_output = self.mesh.ctrl._run_fake(_fake_reduce, (self._fake, self.mesh, dim, reduction, scatter), {})
+            fake_output = fake_call(_fake_reduce, (self._fake, self.mesh, dim, reduction, scatter), {})
         r = Tensor(fake_output, self.mesh, self.stream, borrowed=False)
         assert r.ref is not None
         self.mesh._send(messages.Reduce(r, self, self._factory(), self.mesh, self.stream, dim, reduction, scatter, _inplace))
@@ -285,7 +287,7 @@ for entry in _explain.split('\n\n'):
     k, v = entry.split('\n', 1)
     explain[k] = v
 
-def dtensor_check(func, args, kwargs, device_mesh, stream) -> Tuple[List['Tensor'], Any]:
+def _dtensor_input_check(func: 'RemoteFunction', args, kwargs, device_mesh, stream) -> Tuple[List['Tensor'], Any]:
     def stringify(t):
         if isinstance(t, Tensor):
             if t.mesh is not device_mesh:
@@ -311,7 +313,7 @@ def dtensor_check(func, args, kwargs, device_mesh, stream) -> Tuple[List['Tensor
             if fkwargs:
                 actuals = f'{actuals}, ' + ', '.join(f'{k}={v}' for k, v in kwargs.items())
 
-            call = f"{func}({actuals})"
+            call = f"{func.path}({actuals})"
             dmesh = f'active_mesh = {device_mesh}\nactive_stream = {stream}'
             help = '\n'.join(f'{k}: {v}' for k, v in explain.items() if k in call)
             raise TypeError(f'Mismatched arguments to distributed tensor operation:\n\n  {call}\n\n{dmesh}\n{help}')
@@ -320,44 +322,42 @@ def dtensor_check(func, args, kwargs, device_mesh, stream) -> Tuple[List['Tensor
     return dtensors, unflatten
 
 
-def dtensor_dispatch(func, args, kwargs, device_mesh: Optional['DeviceMesh'], stream: Stream, result_type):
-    if isinstance(func, torch._ops.OpOverload):
-        func = "torch.ops." + str(func)
-    dtensors, unflatten = dtensor_check(func, args, kwargs, device_mesh, stream)
-    assert device_mesh is not None
+def dtensor_check(func: 'RemoteFunction', args, kwargs, device_mesh: Optional['DeviceMesh'], stream: Stream):
+    dtensors, unflatten = _dtensor_input_check(func, args, kwargs, device_mesh, stream)
     if device_mesh is None:
         raise ValueError("Remote functions require an active device mesh (use `with active_mesh(mesh):`")
     ctrl = device_mesh.ctrl
     stream._use_controller(ctrl)
 
     mutates = []
-    if callable(result_type):
-        fake_input_tensors = [d._fake for d in dtensors]
-        before_versions = [f._version for f in fake_input_tensors]
-        fake_args, fake_kwargs = unflatten(fake_input_tensors)
-        result = ctrl._run_fake(result_type, fake_args, fake_kwargs)
-        for i in range(len(dtensors)):
-            if before_versions[i] < fake_input_tensors[i]._version:
-                borrows = dtensors[i]._borrows
-                writing_stream = borrows.writing_stream
-                if writing_stream is not stream:
-                    reason = "it is read only because it is being borrowed" if writing_stream is None \
-                             else f"it can only be mutated by f{writing_stream}"
-                    tbs = ''.join(f"Traceback of borrow to {k} (most recent frame last):\n{''.join(traceback.format_list(b.frames))}" for k,b in borrows.active.items())
-                    raise ValueError(f"\n{tbs}\nTensor input {i} would be mutated by this operator but {reason}")
-                # we might still have alias to other streams if they have been dropped but not yet __del__'d
-                mutates.extend(alias for alias in dtensors[i]._borrows.aliases if alias.stream is stream)
-        fake_map = {id(f): i for i, f in enumerate(fake_input_tensors)}
-    else:
-        result = result_type
-        fake_map = {}
+    assert callable(func.propagate)
+    fake_input_tensors = [d._fake for d in dtensors]
+    before_versions = [f._version for f in fake_input_tensors]
+    fake_args, fake_kwargs = unflatten(fake_input_tensors)
+    result = func.fake_call(fake_args, fake_kwargs)
+    for i in range(len(dtensors)):
+        if before_versions[i] < fake_input_tensors[i]._version:
+            borrows = dtensors[i]._borrows
+            writing_stream = borrows.writing_stream
+            if writing_stream is not stream:
+                reason = "it is read only because it is being borrowed" if writing_stream is None \
+                            else f"it can only be mutated by f{writing_stream}"
+                tbs = ''.join(f"Traceback of borrow to {k} (most recent frame last):\n{''.join(traceback.format_list(b.frames))}" for k,b in borrows.active.items())
+                raise ValueError(f"\n{tbs}\nTensor input {i} would be mutated by this operator but {reason}")
+            # we might still have alias to other streams if they have been dropped but not yet __del__'d
+            mutates.extend(alias for alias in dtensors[i]._borrows.aliases if alias.stream is stream)
+    return result, dtensors, tuple(mutates)
 
-    fake_result_dtensors, unflatten_result = flatten(result, lambda x: isinstance(x, torch.Tensor))
+def dtensor_dispatch(func: 'RemoteFunction', args, kwargs, device_mesh: Optional['DeviceMesh'], stream: Stream):
+    fake_result, dtensors, mutates = dtensor_check(func, args, kwargs, device_mesh, stream)
+    assert device_mesh is not None
 
+    fake_map = {id(d._fake): i for i, d in enumerate(dtensors)}
+    fake_result_dtensors, unflatten_result = flatten(fake_result, lambda x: isinstance(x, torch.Tensor))
     # sometimes operators return references to inputs, in which case the result should be the same DTensor object
     # otherwise we create a new DTensor with a new RemoteRef for the result
     result_dtensors = tuple(dtensors[fake_map[id(fake)]] if id(fake) in fake_map else Tensor(fake, device_mesh, stream, False) for fake in fake_result_dtensors)
-    ident = device_mesh.ctrl.history.ident(result_dtensors + tuple(mutates), dtensors)
+    ident = device_mesh.ctrl.history.ident(result_dtensors + mutates, dtensors)
     assert all(t.ref is not None for t in result_dtensors)
     assert all(t.ref is not None for t in mutates)
     device_mesh._send(messages.CallFunction(ident, result_dtensors, tuple(mutates), func, args, kwargs, stream))    

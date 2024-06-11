@@ -8,12 +8,13 @@ from .history import RemoteException
 from .stream import active_stream, Stream
 from .future import Future
 from .tensor import Tensor, dtensor_check
-from .device_mesh import DeviceMesh, remote_function, active_mesh
+from .device_mesh import DeviceMesh, remote_function, active_mesh, RemoteFunction
 from .ndslice import NDSlice
 from . import stream, device_mesh
 from .controller import Controller as _Controller
 from .backend import ProcessBackend as _ProcessBackend
-def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: Optional[str] = None):
+
+def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: Optional[RemoteFunction] = None):
     """
     Retrieve the shard at `coordinates` of the current device mesh of each tensor in obj.
         obj - a pytree containing the tensors the fetch
@@ -26,11 +27,15 @@ def fetch_shard(obj, coordinates: Optional[Dict[str, int]] = None, preprocess: O
         raise RuntimeError("No device mesh active")
     mesh = device_mesh._active
     ctrl = mesh.ctrl
-    tensors, _ = dtensor_check('fetch_shard', (obj,), {}, mesh, stream._active)
+    if preprocess is None:
+        remote = RemoteFunction('fetch_shard', lambda x: x)
+    else:
+        remote = preprocess
+    fake_result, dtensors, mutates = dtensor_check(remote, (obj,), {}, mesh, stream._active)
     fut = Future(ctrl)
-    ident = ctrl.history.ident((), tensors, fut)
+    ident = ctrl.history.ident(mutates, dtensors, fut)
     process = mesh._process(coordinates)
-    ctrl.send(process, messages.FetchValue(ident, preprocess, obj, stream._active))
+    ctrl.send(process, messages.FetchValue(ident, mutates, preprocess, obj, stream._active))
     return fut
 
 

@@ -7,8 +7,10 @@ from functools import partial
 from threading import Thread
 from controller.backend import ProcessBackend
 from controller.controller import Controller
-
+from controller.backend import MockBackend
+from controller.ndslice import NDSlice
 from controller import world_mesh, active_mesh
+from controller.device_mesh import DeviceMesh
 import signal
 from time import sleep
 import logging
@@ -115,4 +117,11 @@ def example_mesh(hosts: int, gpus: int):
         except StopIteration:
             pass
     dm.exit = exit
+    return dm
+
+def mock_mesh(hosts: int, gpus: int):
+    backend = MockBackend(hosts*gpus)
+    ctrl = Controller(backend)
+    dm = DeviceMesh(ctrl, NDSlice(0, [hosts, gpus], [gpus, 1]), ('host', 'gpu'))
+    dm.exit = lambda: None
     return dm

@@ -1,5 +1,5 @@
 from supervisor import ProcessList
-from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple, List
+from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple,  Callable, Any, Union
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import torch
@@ -12,11 +12,38 @@ from .tensor import dtensor_dispatch
 from .ndslice import NDSlice
 import itertools
 
+from .fake import fake_call
+
 if TYPE_CHECKING:
     from .controller import Controller
 
-def remote_function(path: str):
-    return lambda func: lambda *args, **kwargs: dtensor_dispatch(path, args, kwargs, _active, stream._active, func)
+
+class RemoteFunction:
+    def __init__(self, real, propagate: Callable):
+        if isinstance(real, torch._ops.OpOverload):
+            path = "torch.ops." + str(real)
+        else:
+            path = real
+        self.path: Union[str, Callable] = path
+        self.propagate = propagate
+    
+    def fake_call(self, args, kwargs):
+        return fake_call(self.propagate, args, kwargs)
+
+    def __reduce_ex__(self, protocol):
+        return messages.RemoteFunction, (self.path,)
+
+    def __call__(self, *args: Any, **kwargs):
+        return dtensor_dispatch(self, args, kwargs, _active, stream._active)
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return lambda *args, **kwargs: self(instance, *args, **kwargs)
+
+
+def remote_function(path):
+    return lambda propagate: RemoteFunction(path, propagate)
 
 class DeviceMesh(Referenceable):
     def __init__(self, ctrl: 'Controller', processes: 'NDSlice', names: Tuple[str, ...]):
@@ -132,7 +159,7 @@ class _ActiveMesh(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if _active is None:
             return func(*args, **kwargs)
-        return dtensor_dispatch(func, args, kwargs, _active, stream._active, func)
+        return dtensor_dispatch(RemoteFunction(func, func), args, kwargs, _active, stream._active)
 
 @contextmanager
 def _dispatch():

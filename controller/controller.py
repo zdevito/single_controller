@@ -1,7 +1,6 @@
 from supervisor import TTL
 from typing import Dict, Optional, List, NamedTuple, Union
-from concurrent.futures import ThreadPoolExecutor
-from torch._subclasses.fake_tensor import FakeTensorMode
+
 
 import torch
 import torch.distributed
@@ -19,23 +18,7 @@ import traceback
 from weakref import WeakKeyDictionary
 import logging
 
-logger = logging.getLogger(__name__)
-
-check_correctness_per_operator = False
-if check_correctness_per_operator:
-    class RealMode:
-        def from_tensor(self, t):
-            return t
-
-        def __enter__(self):
-            pass
-
-        def __exit__(self, *args):
-            pass
-
-    fake_mode = RealMode()
-else:
-    fake_mode = FakeTensorMode()
+logger = logging.getLogger(__name__)    
 
 _CONTROLLER_STATUS_INTERVAL = 2
 
@@ -50,15 +33,8 @@ class Controller:
         self.incomplete_futures = {}
         self.controller_status_ttl = TTL(_CONTROLLER_STATUS_INTERVAL)
         self.allocation_borrows: WeakKeyDictionary[torch.UntypedStorage, Borrows] = WeakKeyDictionary()
-        self.fake_mode_worker = ThreadPoolExecutor(max_workers=1)
         self.history = History(self.backend.world_size)
         stream._active = Stream("main", _default=True)
-
-    def _run_fake(self, func, args, kwargs):
-        def work():
-            with fake_mode:
-                return func(*args, **kwargs)
-        return self.fake_mode_worker.submit(work).result()
 
     def send(self, ranks: Union[NDSlice, List[NDSlice]], msg: NamedTuple):
         self.backend.send(ranks, msg)
