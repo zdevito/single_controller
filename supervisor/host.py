@@ -51,6 +51,7 @@ class Process:
         world_size: int,
         popen: Mapping[str, Any],
         proc_addr: str,
+        start_new_session: bool
     ) -> None:
         self.proc_id = proc_id
         self.proc_comm = proc_comm
@@ -83,7 +84,7 @@ class Process:
                 self.subprocess: subprocess.Popen[str] = subprocess.Popen(
                     # pyre-ignore
                     **popen,
-                    start_new_session=True,
+                    start_new_session=start_new_session,
                     stdout=logfile,
                     stderr=logfile,
                 )
@@ -115,7 +116,7 @@ class Host:
     Starts an event loop listening for commands from the supervisor, including launching/killing processes.
     """
 
-    def __init__(self, supervisor_port: str) -> None:
+    def __init__(self, supervisor_port: str, start_new_session: bool = True) -> None:
         self.context: zmq.Context = zmq.Context(1)
         self.supervisor_comm: zmq.Socket = self.context.socket(zmq.DEALER)
         self.supervisor_comm.setsockopt(zmq.IPV6, True)
@@ -144,6 +145,7 @@ class Host:
         self._launches = 0
         self.has_shutdown = False
         self.exits: List[bytes] = []
+        self.start_new_session = start_new_session
 
     def heartbeat(self) -> None:
         self.supervisor_comm.send(b"")
@@ -177,6 +179,7 @@ class Host:
                 world_size,
                 popen,
                 self.proc_addr,
+                self.start_new_session,
             )
             self.process_table[process.proc_id_bytes] = process
             self.on_subprocess_exit(
@@ -191,10 +194,16 @@ class Host:
         self.process_table.pop(process.proc_id_bytes)
         # we do not allow descendents to outlive the parent
         # if any remain this kill will clean them up
-        os.killpg(process.subprocess.pid, signal.SIGKILL)
+        self.kill(process.subprocess.pid, signal.SIGKILL)
         returncode = process.subprocess.wait()
         if not self.has_shutdown:
             self.exits.append(pickle.dumps(("_exited", process.proc_id, returncode)))
+
+    def kill(self, pid, sig):
+        if self.start_new_session:
+            os.killpg(pid, sig)
+        else:
+            os.kill(pid, sig)
 
     def on_subprocess_exit(
         self, subprocess: subprocess.Popen, on_exit: Callable[[], Any]
@@ -213,7 +222,7 @@ class Host:
         proc_id = _proc_id.to_bytes(8, byteorder="little")
         if proc_id in self.process_table:
             process = self.process_table[proc_id]
-            if group:
+            if group and self.start_new_session:
                 os.killpg(process.subprocess.pid, sig)
             else:
                 process.subprocess.send_signal(sig)
@@ -229,7 +238,7 @@ class Host:
             return
         self.has_shutdown = True
         for proc in self.process_table.values():
-            os.killpg(proc.subprocess.pid, signal.SIGTERM)
+            self.kill(proc.subprocess.pid, signal.SIGTERM)
         expiry = time.time() + ABORT_INTERVAL
         ttl = ABORT_INTERVAL
         while ttl > 0 and self.process_table:
@@ -239,8 +248,7 @@ class Host:
             ttl = time.time() - expiry
         if self.process_table:
             for proc in self.process_table.values():
-                os.killpg(proc.subprocess.pid, signal.SIGKILL)
-
+                self.kill(proc.subprocess.pid, signal.SIGKILL)
 
         self.proc_comm.close(linger=0)
         self.supervisor_comm.close(linger=0)

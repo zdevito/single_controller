@@ -47,15 +47,12 @@ class LocalContext:
         sleep(0)
 
         def run_host(host: HostManager):
-            try:
-                host.run_event_loop_forever()
-            except SystemExit:
-                pass
+            host.run_event_loop_forever()
 
         for _ in range(N):
-            host = HostManager("tcp://127.0.0.1:55555")
+            host = HostManager("tcp://127.0.0.1:55555", start_new_session=False)
             self._all_hosts[host] = True
-            thread = Thread(target=partial(run_host, host))
+            thread = Thread(target=partial(run_host, host), daemon=True)
             thread.start()
             threads.append(thread)
 
