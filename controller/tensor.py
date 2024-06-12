@@ -64,7 +64,7 @@ class Tensor(Referenceable, BaseTensor):
         pass
 
     def __repr__(self, *, tensor_contents=None):
-        return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={self._factory()})"
+        return f"DTensor(mesh={self.mesh}, stream={self.stream}, fake={repr(self._fake)})"
 
     def drop(self):
         if self.ref is None:
