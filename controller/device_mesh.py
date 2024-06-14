@@ -27,6 +27,9 @@ class RemoteFunction:
         self.path: Union[str, Callable] = path
         self.propagate = propagate
     
+    def __repr__(self):
+        return f"RemoteFunction(path={self.path})"
+
     def fake_call(self, args, kwargs):
         return fake_call(self.propagate, args, kwargs)
 

@@ -58,6 +58,7 @@ class Tensor(Referenceable, BaseTensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        from .device_mesh import DeviceMesh, RemoteFunction
         return dtensor_dispatch(RemoteFunction(func, func), args, kwargs, None, stream._active)
 
     def __init__(self, fake: torch.Tensor, mesh: 'DeviceMesh', stream: Stream, borrowed: bool):
