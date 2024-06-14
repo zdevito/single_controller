@@ -2,6 +2,7 @@ from supervisor import Context, Host, FunctionCall, TTL, Process
 from typing import Optional, List, Sequence, NamedTuple, Tuple, Union
 import torch
 from torch.distributed import TCPStore
+import contextlib
 from .ndslice import NDSlice
 from collections import deque
 from . import messages
@@ -103,9 +104,10 @@ class ProcessBackend(Backend):
                                              'STORE_PORT': str(store.port), })
 
 class MockBackend(Backend):
-    def __init__(self, world_size: int):
+    def __init__(self, world_size: int, verbose: bool = True):
         self._world_size = world_size
         self.responses = deque[Tuple[int, NamedTuple]]()
+        self.verbose = False
 
     @property
     def world_size(self):
@@ -127,7 +129,8 @@ class MockBackend(Backend):
         attr = getattr(self, type(msg).__name__, None)
         if attr is not None:
             attr(ranks, *msg)
-        print(ranks, msg)
+        if self.verbose:
+            print(ranks, msg)
 
     def recvready(self, timeout: Optional[float]) -> Sequence[Tuple[int, NamedTuple]]:
         r = tuple(self.responses)
