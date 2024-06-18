@@ -9,6 +9,7 @@ from controller.backend import ProcessBackend
 from controller.controller import Controller
 from controller.backend import MockBackend
 from controller.ndslice import NDSlice
+from controller.simulator import SimulatorBackend
 from controller import world_mesh, active_mesh
 from controller.device_mesh import DeviceMesh
 import signal
@@ -102,7 +103,7 @@ class LocalContext:
 
 
 def _example_mesh(hosts: int, gpus: int):
-    with LocalContext() as c, c.local_device_mesh(2, 2, activate=False) as dm:
+    with LocalContext() as c, c.local_device_mesh(hosts, gpus, activate=False) as dm:
         yield dm
 
 def example_mesh(hosts: int, gpus: int):
@@ -118,6 +119,13 @@ def example_mesh(hosts: int, gpus: int):
 
 def mock_mesh(hosts: int, gpus: int):
     backend = MockBackend(hosts*gpus)
+    ctrl = Controller(backend)
+    dm = DeviceMesh(ctrl, NDSlice(0, [hosts, gpus], [gpus, 1]), ('host', 'gpu'))
+    dm.exit = lambda: None
+    return dm
+
+def simulator_mesh(hosts: int, gpus: int):
+    backend = SimulatorBackend(hosts*gpus)
     ctrl = Controller(backend)
     dm = DeviceMesh(ctrl, NDSlice(0, [hosts, gpus], [gpus, 1]), ('host', 'gpu'))
     dm.exit = lambda: None
