@@ -107,7 +107,7 @@ class MockBackend(Backend):
     def __init__(self, world_size: int, verbose: bool = True):
         self._world_size = world_size
         self.responses = deque[Tuple[int, NamedTuple]]()
-        self.verbose = False
+        self.verbose = verbose
 
     @property
     def world_size(self):

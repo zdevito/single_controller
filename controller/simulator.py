@@ -258,7 +258,7 @@ class Task:
 from torch.utils._pytree import tree_leaves
 class SimulatorBackend(MockBackend):
     def __init__(self, world_size: int):
-        super().__init__(world_size)
+        super().__init__(world_size, verbose = False)
         self.worker_commands = defaultdict(list)
 
     def send(self, ranks: Union[NDSlice, List[NDSlice]], msg) -> None:
