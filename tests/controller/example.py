@@ -4,7 +4,7 @@ import torch
 from controller._testing import example_mesh, mock_mesh
 from controller.device_mesh import remote_function
 
-mocked = False
+mocked = True
 if mocked:
     device_mesh = mock_mesh(hosts=2, gpus=2)
 else:
