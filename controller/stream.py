@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, List, Callable
 from . import messages
 from .reference import Referenceable
 from .borrows import Borrow
@@ -79,10 +79,14 @@ class Stream(Referenceable):
 
 
 _active = Stream('main')
+_on_change: List[Callable] = []
 
 @contextmanager
 def active_stream(stream: Stream):
     global _active
+    for on_change in _on_change:
+        on_change(_active, stream)
+
     _active, old = stream, _active
     try:
         yield

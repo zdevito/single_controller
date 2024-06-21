@@ -1,5 +1,5 @@
 from supervisor import ProcessList
-from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple,  Callable, Any, Union
+from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple,  Callable, Any, Union, List
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import torch
@@ -177,9 +177,13 @@ def _dispatch():
         finally:
             _dispatch_enabled = False
 
+_on_change: List[Callable] = []
+
 @contextmanager
 def active_mesh(mesh: Optional[DeviceMesh]):
     global _active
+    for on_change in _on_change:
+        on_change(_active, mesh)
     _active, old = mesh, _active
     try:
         with _dispatch():

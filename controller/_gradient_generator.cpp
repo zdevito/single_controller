@@ -23,6 +23,18 @@ using torch::autograd::InputBuffer;
 using torch::autograd::THPCppFunction_Check;
 using torch::autograd::THPCppFunction;
 
+using ContextRestorer = std::function<std::function<void()>(const at::Tensor&, std::optional<size_t>, bool)>;
+
+struct ContextGuard {
+    ContextGuard(std::function<void()> exit)
+    : exit_(std::move(exit)) {}
+    ~ContextGuard() {
+        exit_();
+    }
+private:
+    std::function<void()> exit_;
+};
+
 template<typename T>
 struct Slice {
     T* begin() const { return begin_; }
@@ -179,9 +191,13 @@ struct CompareNode {
     }
 };
 
+std::function<void()> emptyContext(const at::Tensor& t, std::optional<size_t> sequence_nr, bool last) {
+    return [](){};
+}
+
 struct GradientGenerator {
-    GradientGenerator(std::vector<Root> roots = {}, std::vector<Edge> with_respect_to = {})
-    : roots_(std::move(roots)), with_respect_to_(with_respect_to) {
+    GradientGenerator(std::vector<Root> roots = {}, std::vector<Edge> with_respect_to = {}, ContextRestorer cr = emptyContext)
+    : roots_(std::move(roots)), with_respect_to_(with_respect_to), context_restorer_(std::move(cr)) {
     }
 
 
@@ -235,7 +251,10 @@ private:
                 to_restore.emplace_back();
             }
         }
-        auto& input_buffer = all_input_buffers_.at(ready->input_buffers_offset);
+        // no need for example tensor because the only case we do not have a sequence nr
+        // is accumulate grad nodes. accumulate grad nodes do not ever get run.
+        auto guard = restoreContext(ready, at::Tensor(), stage == ready->last_stage);
+        auto& input_buffer = realInputBuffer(ready);
         std::vector<at::Tensor> inputs = (stage == ready->last_stage) ? std::move(input_buffer.buffer) : input_buffer.buffer;
         std::vector<at::Tensor> outputs = (*node)(std::move(inputs));
         if (stage == ready->last_stage) {
@@ -263,10 +282,26 @@ private:
             return std::make_pair(true, state);
         }
     }
+
+    ContextGuard restoreContext(NodeState* node, const at::Tensor& example, bool last) {
+        std::optional<size_t> sequence_nr = node->node->sequence_nr();
+        if (sequence_nr == UINT64_MAX) {
+            // node is AccumulateGrad. Normally we can figure out the appropriate context from
+            // the tensor being added. The only exception is
+            sequence_nr = std::nullopt;
+        }
+        return ContextGuard(context_restorer_(example, sequence_nr, last));
+    }
+
     void add(NodeState* node, size_t input_nr, at::Tensor t) {
         std::cout << "// add: " << node->node->name() << ", input_nr=" << (int)input_nr << "\n";
-        all_input_buffers_.at(node->input_buffers_offset).add(input_nr, std::move(t), at::nullopt, at::nullopt);
+        realInputBuffer(node).add(input_nr, std::move(t), at::nullopt, at::nullopt);
     }
+    
+    InputBuffer& realInputBuffer(NodeState* state) {
+        return all_input_buffers_.at(state->input_buffers_offset);
+    }
+
     void buildGraph() {
         std::cout << "digraph G {\nnode [shape=record];\n";
         std::vector<NodeState*> worklist;
@@ -280,8 +315,14 @@ private:
                 worklist.push_back(r.second);
             }
             if (root.grad_root) {
+                ContextGuard guard = restoreContext(r.second, *root.grad_root, false);
                 add(r.second, root.reference.input_nr, *root.grad_root);
             } else {
+                // XXX - corner case: this is a grad accumulate node (no sequence number)
+                // then there is no example tensor, and no sequence number to look up what to restore.
+                // We will end up using the current device_mesh/stream. Probably not important because it only 
+                // happens in a degenerate autograd call (root and with_respect_to are the same tensor)
+                ContextGuard guard = restoreContext(r.second, realInputBuffer(r.second).buffer.at(root.reference.input_nr), false);
                 auto & md = r.second->node->input_metadata(root.reference.input_nr);
                 add(r.second, root.reference.input_nr, torch::ones_symint(md.shape_as_dim_vector(), md.options()));
             }
@@ -358,7 +399,7 @@ private:
         for (auto i : c10::irange(ready->input_buffers.size())) {
             auto result_index = ready->input_buffers[i].result_index;
             if (result_index != NOT_NEEDED) {
-                auto& t = all_input_buffers_[ready->input_buffers_offset].buffer.at(i);
+                auto& t = realInputBuffer(ready).buffer.at(i);
                 results_.at(result_index) = (ready->needed == NOT_NEEDED) ? std::move(t) : t;
             }
         }
@@ -388,6 +429,7 @@ private:
     std::vector<InputBuffer> all_input_buffers_;
     std::priority_queue<std::pair<int, NodeState*>, std::vector<std::pair<int, NodeState*>>, CompareNode> ready_heap_;
     int next_buffer_ = 0;
+    ContextRestorer context_restorer_;
     Arena arena_;
 };
 
@@ -424,9 +466,9 @@ std::optional<Edge> parseEdge(PyObject *obj) {
 
 static int PyGradientGenerator_init(PyGradientGenerator *self, PyObject *args, PyObject *kwds) {
     HANDLE_TH_ERRORS
-    PyObject *roots_list, *with_respect_to_list, *grad_roots_list = nullptr;
-    static char *kwlist[] = {"roots", "with_respect_to", "grad_roots", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO|O", kwlist, &roots_list, &with_respect_to_list, &grad_roots_list)) {
+    PyObject *roots_list, *with_respect_to_list, *grad_roots_list, *context_restorer = nullptr;
+    static char *kwlist[] = {"roots", "with_respect_to", "grad_roots", "context_restorer", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO|OO", kwlist, &roots_list, &with_respect_to_list, &grad_roots_list, &context_restorer)) {
         return -1;
     }
     std::vector<Root> roots;
@@ -474,14 +516,27 @@ static int PyGradientGenerator_init(PyGradientGenerator *self, PyObject *args, P
         }
         for (Py_ssize_t i = 0; i < num_grad_roots; i++) {
             PyObject *tensor_obj = PyList_GetItem(grad_roots_list, i);
-            if (!THPVariable_Check(tensor_obj)) {
-                PyErr_SetString(PyExc_TypeError, "Each item in grad_roots must be a Tensor");
-                return -1;
+            if (!Py_IsNone(tensor_obj)) {
+                if (!THPVariable_Check(tensor_obj)) {
+                    PyErr_SetString(PyExc_TypeError, "Each item in grad_roots must be a Tensor");
+                    return -1;
+                }
+                roots.at(i).grad_root = THPVariable_Unpack(tensor_obj);
             }
-            roots.at(i).grad_root = THPVariable_Unpack(tensor_obj);
         }
     }
-    self->obj = new GradientGenerator(std::move(roots), std::move(with_respect_to));
+    ContextRestorer restore_context = emptyContext;
+    if (context_restorer) {
+        auto obj = py::reinterpret_borrow<py::object>(context_restorer);
+        restore_context = [obj = std::move(obj)] (const at::Tensor& example, std::optional<size_t> sequence_nr, bool last) mutable {
+            auto it = py::iter(obj(example, sequence_nr, last));
+            it++;
+            return [it = std::move(it)]() mutable {
+                it++;
+            };
+        };
+    }
+    self->obj = new GradientGenerator(std::move(roots), std::move(with_respect_to), std::move(restore_context));
     return 0;
     END_HANDLE_TH_ERRORS_RET(-1);
 }

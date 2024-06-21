@@ -359,6 +359,19 @@ class TestController(TestCase):
             check(s)
 
 
+    def test_autograd(self):
+        from controller.gradient_generator import grad_generator
+        with self.local_device_mesh(2, 2) as device_mesh:
+            x = torch.rand(3, 4, requires_grad=True)
+            y = torch.rand(4, 3, requires_grad=True)
+            z = torch.rand(3, requires_grad=True)
+
+            l = (x @ y + z).sum()
+            with active_mesh(None):
+                # check backward restores forward mesh
+                for x in grad_generator(l, [z, y, x]):
+                    with active_mesh(device_mesh):
+                        fetch_shard(x).result()
 
 if __name__ == "__main__":
     try:
