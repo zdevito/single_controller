@@ -1,5 +1,7 @@
 import traceback
 import sys
+
+from torch.types import Device
 from supervisor.logging import fix_exception_lines
 def custom_excepthook(exc_type, exc_value, exc_traceback):
     tb_lines = fix_exception_lines(traceback.format_exception(exc_type, exc_value, exc_traceback))
@@ -12,6 +14,7 @@ from supervisor import Context, HostConnected
 from supervisor.host import Host as HostManager
 from controller import world_mesh, active_mesh, _Controller, DeviceMesh, remote_function, Future, RemoteException, fetch_shard, Stream, active_stream
 from controller.ndslice import NDSlice
+from controller.gradient_generator import grad_generator, grad_function
 from contextlib import contextmanager, ExitStack
 from threading import Thread
 from functools import cache, partial
@@ -360,7 +363,6 @@ class TestController(TestCase):
 
 
     def test_autograd(self):
-        from controller.gradient_generator import grad_generator
         with self.local_device_mesh(2, 2) as device_mesh:
             x = torch.rand(3, 4, requires_grad=True)
             y = torch.rand(4, 3, requires_grad=True)
@@ -372,6 +374,33 @@ class TestController(TestCase):
                 for x in grad_generator(l, [z, y, x]):
                     with active_mesh(device_mesh):
                         fetch_shard(x).result()
+
+    def test_autograd_multi_mesh(self):        
+        @grad_function
+        def to_mesh(x: torch.Tensor, mesh: DeviceMesh):
+            omesh = x.mesh
+            def backward(grad_x: torch.Tensor):
+                print(grad_x.mesh, omesh)
+                return grad_x.to_mesh(omesh), None
+            return x.to_mesh(mesh), backward
+
+        with self.local_device_mesh(2, 2) as device_mesh:
+            host0 = device_mesh(host=0)
+            host1 = device_mesh(host=1)
+            with active_mesh(host0):
+                x = torch.rand(3, 4, requires_grad=True, device='cuda')
+                y = torch.rand(4, 3, requires_grad=True, device='cuda')
+                t = x @ y
+                t = to_mesh(t, host1)
+            print("STARTING HOST1")
+            with active_mesh(host1):
+                z = torch.rand(3, requires_grad=True, device='cuda')
+                l =  (t + z).sum()
+
+            for r in grad_generator(l, [z, y, x]):
+                with active_mesh(r.mesh):
+                    print(fetch_shard(r).result())
+
 
 if __name__ == "__main__":
     try:

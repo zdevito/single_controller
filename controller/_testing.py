@@ -88,12 +88,18 @@ class LocalContext:
     def local_device_mesh(self, N, gpu_per_host, activate=True):
         ctx, hosts, processes = self._processes(N, gpu_per_host)
         dm = world_mesh(ctx, hosts, gpu_per_host, _processes=processes)
-        if activate:
-            with active_mesh(dm):
+        try:
+            if activate:
+                with active_mesh(dm):
+                    yield dm
+            else:
                 yield dm
-        else:
-            yield dm
-        dm.ctrl.shutdown()
+            dm.ctrl.shutdown()
+        except:
+            # abnormal exit, so we just make sure we do not try to communicate in destructors,
+            # but we do notn wait for workers to exit since we do not know what state they are in.
+            dm.ctrl._shutdown = True
+            raise
 
     def __enter__(self):
         return self

@@ -171,6 +171,8 @@ class Tensor(Referenceable, BaseTensor):
             raise KeyError(f'dim {dim} not found in {self.mesh}')
         if reduction not in _valid_reduce.__args__:
             raise ValueError(f'reduction {reduction} not supported, reductions are {_valid_reduce.__args__}')
+        _no_autograd(self)
+        
         if mesh is None:
             mesh = self.mesh
 
@@ -208,6 +210,10 @@ class Tensor(Referenceable, BaseTensor):
     def _factory(self):
         return messages.TensorFactory.from_tensor(self._fake)
 
+def _no_autograd(x):
+    if not torch.is_grad_enabled() or not x.requires_grad:
+        return
+    raise ValueError("Attempting to communciate a tensor that requires gradient. If you want autograd to compute across communication, use a custom autograd function which communicates raw tensors.")
 
 class MeshSliceTensor:
     def __init__(self, tensor: 'Tensor', slicing: 'DeviceMesh'):
@@ -215,6 +221,7 @@ class MeshSliceTensor:
         self.slicing = slicing
 
     def to_mesh(self, mesh: 'DeviceMesh') -> 'Tensor':
+        _no_autograd(self.tensor)        
         sizes = []
         strides = []
         for name, size in zip(mesh.names, mesh.processes.sizes):

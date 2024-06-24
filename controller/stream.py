@@ -91,4 +91,6 @@ def active_stream(stream: Stream):
     try:
         yield
     finally:
+        for on_change in _on_change:
+            on_change(_active, old)
         _active = old

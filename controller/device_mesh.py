@@ -189,4 +189,6 @@ def active_mesh(mesh: Optional[DeviceMesh]):
         with _dispatch():
             yield
     finally:
+        for on_change in _on_change:
+            on_change(_active, old)
         _active = old
