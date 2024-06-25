@@ -20,7 +20,7 @@ class Context(NamedTuple):
     stream: 'stream.Stream'
 
     def enable(self):
-        with active_mesh(self.device_mesh), active_stream(self.stream):
+        with active_mesh(self.device_mesh), active_stream(self.stream), torch.no_grad():
             yield
 
 
@@ -48,9 +48,9 @@ stream._on_change.append(lambda old, stream: _update_context_map(Context(device_
 
 
 def grad_generator(roots: Union[torch.Tensor, Sequence[TensorOrEdge]] = [], with_respect_to: Sequence[TensorOrEdge] = [], grad_roots: Sequence[Optional[torch.Tensor]] = []):
-        if isinstance(roots, torch.Tensor):
-            roots = [roots]
-        return _GradientGenerator(list(roots), list(with_respect_to), list(grad_roots), restore_context)        
+    if isinstance(roots, torch.Tensor):
+        roots = [roots]
+    return _GradientGenerator(list(roots), list(with_respect_to), list(grad_roots), restore_context)        
 
 class GradFunction(torch.autograd.Function):
     @staticmethod

@@ -51,13 +51,13 @@ struct Slice {
 };
 struct Arena {
     Arena() : next_free_(inline_buffer_), remaining_size_(sizeof(inline_buffer_)) {}
-    template<typename T>
-    T* allocate() {
+    template<typename T, typename... Args>
+    T* allocate(Args&&... args) {
         static_assert(std::is_pod<T>::value, "T must be a POD type.");
-        return allocate_slice<T>(1).begin();
+        return allocate_slice<T>(1, std::forward<Args>(args)...).begin();
     }
-    template<typename T>
-    Slice<T> allocate_slice(size_t n) {
+    template<typename T, typename... Args>
+    Slice<T> allocate_slice(size_t n, Args&&... args) {
         static_assert(std::is_pod<T>::value, "T must be a POD type.");
         size_t alignment = alignof(T);
         size_t bytes_needed = n * sizeof(T);
@@ -76,7 +76,11 @@ struct Arena {
         }
         next_free_ += bytes_needed;
         remaining_size_ -= (to_align + bytes_needed);
-        return Slice<T> {result, result + n};
+        auto slice = Slice<T> {result, result + n};
+        for (auto& r : slice) {
+            r.init(std::forward<Args>(args)...);
+        }
+        return slice;
     }
     ~Arena() {
         for (char* buffer : buffers_) {
@@ -105,6 +109,11 @@ struct Use {
     NodeState* user;
     size_t offset;
     Use* next;
+    void init() {
+        user = nullptr;
+        offset = 0;
+        next = nullptr;
+    }
 };
 
 constexpr int NOT_NEEDED = -1;
@@ -121,11 +130,18 @@ struct InputBufferReference {
     int needed;
 };
 
+InputBufferReference not_used = {nullptr, NOT_NEEDED, NOT_NEEDED};
+
 struct EdgeState {
     NodeState* node_state;
     size_t offset;
     Use use;
     InputBufferReference& input_buffer();
+    void init() {
+        node_state = nullptr;
+        offset = 0;
+        use.init();
+    }
 };
 
 struct NodeState {
@@ -133,9 +149,6 @@ struct NodeState {
         node = n;
         input_buffers = arena.allocate_slice<InputBufferReference>(n->num_inputs());
         next = arena.allocate_slice<EdgeState>(n->num_outputs());        
-        for (auto& buf : input_buffers) {
-            buf.init();
-        }
         input_buffers_offset = all_input_buffers.size();
         all_input_buffers.emplace_back(input_buffers.size());
         needed = NOT_NEEDED;
@@ -173,7 +186,7 @@ struct NodeState {
 };
 
 InputBufferReference& EdgeState::input_buffer() {
-    return node_state->input_buffers[offset];
+    return node_state == nullptr ? not_used : node_state->input_buffers[offset];
 }
 
 
@@ -198,14 +211,11 @@ std::function<void()> emptyContext(const at::Tensor& t, std::optional<size_t> se
 struct GradientGenerator {
     GradientGenerator(std::vector<Root> roots = {}, std::vector<Edge> with_respect_to = {}, ContextRestorer cr = emptyContext)
     : roots_(std::move(roots)), with_respect_to_(with_respect_to), context_restorer_(std::move(cr)) {
+        buildGraph();
     }
 
 
     GradientGenerator& iter() {
-        if (!built_) {
-            buildGraph();
-            built_ = true;
-        }
         return *this;
     }
     bool next(std::optional<at::Tensor>& value) {
@@ -276,8 +286,7 @@ private:
         if (it != node_state_.end()) {
             return std::make_pair(false, &(*it->second));
         } else {
-            NodeState* state = arena_.allocate<NodeState>();
-            state->init(arena_, all_input_buffers_, node);
+            NodeState* state = arena_.allocate<NodeState>(arena_, all_input_buffers_, node);
             node_state_.emplace(node, state);
             return std::make_pair(true, state);
         }
@@ -332,6 +341,9 @@ private:
             worklist.pop_back();
             for (auto i : c10::irange(state->node->num_outputs())) {
                 const Edge& producer_edge = state->node->next_edge(i);
+                if (!producer_edge.is_valid()) {
+                    continue;
+                }
                 auto producer_state = getOrCreateState(producer_edge.function.get());
                 if (producer_state.first) {
                     worklist.push_back(producer_state.second);
@@ -421,7 +433,6 @@ private:
         return ready_heap_.top().first;
     }
 
-    bool built_ = false;
     ska::flat_hash_map<Node*, NodeState*> node_state_;
     std::vector<Root> roots_;
     std::vector<Edge> with_respect_to_;

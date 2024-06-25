@@ -188,6 +188,7 @@ def visualize_events(worker_events):
     )
 
     # Show the plot
+    fig.write_html('what.html')
     fig.show()
 
 def analyze_events(worker_events):
