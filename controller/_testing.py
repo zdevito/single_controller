@@ -117,8 +117,8 @@ def example_mesh(hosts: int, gpus: int):
     dm.exit = exit
     return dm
 
-def mock_mesh(hosts: int, gpus: int):
-    backend = MockBackend(hosts*gpus)
+def mock_mesh(hosts: int, gpus: int, verbose=True):
+    backend = MockBackend(hosts*gpus, verbose=verbose)
     ctrl = Controller(backend)
     dm = DeviceMesh(ctrl, NDSlice(0, [hosts, gpus], [gpus, 1]), ('host', 'gpu'))
     dm.exit = lambda: None

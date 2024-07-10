@@ -93,7 +93,6 @@ l: Future = fetch_shard(reduce_scatter, dict(host=1, gpu=0))
 with active_mesh(None):
     print(l.result())
 
-
 # you don't always want tensor though, so you can pre
 # process the value before sending it:
 l = fetch_shard(reduce_scatter, dict(host=1, gpu=0), has_nan)
@@ -111,11 +110,9 @@ host1 = device_mesh(host=1)
 with active_mesh(host0):
     a = torch.rand(2, 3, device='cuda')
     # send data from one mesh to another
-
     # there is not possibility of mismatched send/recv
     # because both are issued at the same time to 
     # the correct workers. So no possibility of deadlock!
-
     b = a.to_mesh(host1)
 
     # or slice a bigger mesh and send it to another

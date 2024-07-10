@@ -126,6 +126,11 @@ class DeviceMesh(Referenceable):
             raise KeyError(f'{self} does not have dimension {repr(dim)}')
         return torch.full((), 0, dtype=torch.long)
 
+    def size(self, dim: str):
+        if dim not in self.names:
+            raise KeyError(f'{self} does not have dimension {repr(dim)}')
+        return self.processes.sizes[self.names.index(dim)]
+
     def _process(self, coordinates: Optional[Dict[str, int]]) -> NDSlice:
         if coordinates is None:
             return NDSlice(self.processes.offset, [1], [1])

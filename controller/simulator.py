@@ -72,7 +72,6 @@ def simulate_commands(worker_commands):
                     processed_events[output_id] = new_event
 
         if not progress:
-            return worker_events
             import ipdb; ipdb.set_trace()
             raise RuntimeError(f"Stuck. {worker_queues}")
         
@@ -111,7 +110,6 @@ def visualize_events(worker_events):
                 'End': event.end,
                 'Duration': event.end - event.start
             })
-
     df = pd.DataFrame(records)
 
     # Create Gantt chart using plotly.graph_objs
@@ -142,6 +140,9 @@ def visualize_events(worker_events):
     
     def get_color(metas):
         color = None
+        if "collective" in metas:
+            return "green"
+
         if "fw" in metas:
             for meta in metas:
                 if meta.isdigit():
@@ -197,13 +198,13 @@ def analyze_events(worker_events):
         for event in worker:
             end_time = max(end_time, event.end)
     used_time = 0
-    for worker in worker_events[0]:
-        used_time += worker.runtime
+    for event in worker_events[0]:
+        used_time += event.runtime
     print(f"End Time: ", end_time)
     print(f"Used Time: {100 * used_time/end_time:.2f}%")
     print(f"Bubble size: {100 - 100 * used_time/end_time:.2f}%")
         
-from .messages import CallFunction, SendTensor, DeleteRefs, CommandGroup
+from .messages import CallFunction, SendTensor, DeleteRefs, CommandGroup, BorrowCreate, Reduce, BorrowFirstUse, BorrowDrop
 
 META_VAL = []
 
@@ -232,17 +233,25 @@ def get_runtime(msg):
                 torch.ops.aten.mm.default(*cur_args)
             counted_flops = mode.get_total_flops()
             return counted_flops
+        elif msg.function.path == 'torch.ops.aten.addmm.default':
+            from torch.utils.flop_counter import FlopCounterMode
+            cur_args = tree_map(get_fake_tensor, msg.args)
+            with FlopCounterMode(display=False) as mode:
+                torch.ops.aten.addmm.default(*cur_args)
+            counted_flops = mode.get_total_flops()
+            return counted_flops
 
         return 0
     if isinstance(msg, SendTensor):
         if msg.from_ranks == msg.to_ranks:
             return 0
         return 0
+    if isinstance(msg, Reduce):
+        return get_fake_tensor(msg.local_tensor_ref).numel() * 1e3 // 2
     raise NotImplementedError()
 
 class Task:
     def __init__(self, inputs, outputs, runtime: float, meta, worker, collectives=None):
-        global ID_CNT
         self.inputs = inputs
         self.outputs = outputs
         self.runtime = runtime
@@ -260,6 +269,7 @@ class SimulatorBackend(MockBackend):
     def __init__(self, world_size: int):
         super().__init__(world_size, verbose = False)
         self.worker_commands = defaultdict(list)
+        self.borrows = []
 
     def send(self, ranks: Union[NDSlice, List[NDSlice]], msg) -> None:
         super().send(ranks, msg)
@@ -281,7 +291,7 @@ class SimulatorBackend(MockBackend):
                 meta = f"call: {msg.function.path}"
                 for rank in ranks:
                     for worker in rank:
-                        self.worker_commands[worker].append(Task(inputs=inputs, outputs=outputs, runtime=get_runtime(msg), meta=meta, worker=worker))
+                        self.worker_commands[(worker, msg.stream.name)].append(Task(inputs=inputs, outputs=outputs, runtime=get_runtime(msg), meta=meta, worker=(worker, msg.stream.name)))
             elif isinstance(msg, SendTensor):
                 inputs = get_ids(msg.tensor)
                 outputs = get_ids(msg.result)
@@ -294,6 +304,27 @@ class SimulatorBackend(MockBackend):
                         self.worker_commands[worker].append(Task(inputs=inputs, outputs=outputs, runtime=get_runtime(msg), meta=meta, worker=worker,  collectives=collectives))
             elif isinstance(msg, DeleteRefs):
                 # not modeling memory for now
+                return
+            elif isinstance(msg, BorrowCreate):
+                inputs = get_ids(msg.tensor)
+                outputs = get_ids(msg.result)
+                meta="borrow"
+                for rank in ranks:
+                    for worker in rank:
+                        self.worker_commands[(worker, msg.to_stream.name)].append(Task(inputs=inputs, outputs=outputs, runtime=0, meta=meta, worker=(worker, msg.to_stream.name)))
+                # import ipdb; ipdb.set_trace()
+                # self.borrows.append((msg.from_stream, msg.to_stream, ))
+            elif isinstance(msg, Reduce):
+                inputs = get_ids(msg.local_tensor_ref)
+                outputs = get_ids(msg.result)
+                meta = "collective"
+                collectives = []
+                for rank in ranks:
+                    for worker in rank:
+                        self.worker_commands[(worker, msg.stream_ref.name)].append(Task(inputs=inputs, outputs=outputs, runtime=get_runtime(msg), meta=meta, worker=(worker, msg.stream_ref.name), collectives=collectives))
+            elif isinstance(msg, BorrowFirstUse):
+                return
+            elif isinstance(msg, BorrowDrop):
                 return
             else:
                 print(msg)

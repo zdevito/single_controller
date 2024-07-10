@@ -10,6 +10,9 @@ from controller import (
     Stream,
     get_active_stream,
 )
+from torch.utils._pytree import tree_map_only, tree_flatten, tree_unflatten
+from torch.func import functional_call
+
 
 class Continuation(object):
     def __init__(self, continuation, values):
@@ -18,6 +21,11 @@ class Continuation(object):
     
     def __call__(self, *args):
         return self.continuation(*args)
+
+def explicit_module(mod):
+    def mod_call(params, *args):
+        return functional_call(mod, params, args)
+    return explicit_autograd(mod_call)
 
 def explicit_autograd(f):
     saved_values = {}
@@ -32,9 +40,9 @@ def explicit_autograd(f):
         return val
 
     def wrapped_f(*fw_inps):
-        for x in fw_inps:
-            x.requires_grad_(True)
-        diff_ins = fw_inps
+        tree_map_only(torch.Tensor, lambda x: x.requires_grad_(True), fw_inps)
+        flat_inps, inp_spec = tree_flatten(fw_inps)
+        diff_ins = flat_inps
         with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
             with set_meta("fw"):
                 fw_outs = f(*fw_inps)
@@ -42,7 +50,9 @@ def explicit_autograd(f):
         def bw_call(*grad_outs):
             with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
                 with set_meta("bw"):
-                    return torch.autograd.grad(outputs = fw_outs, inputs=fw_inps, grad_outputs=grad_outs)
+                    grads = torch.autograd.grad(outputs = fw_outs, inputs=flat_inps, grad_outputs=grad_outs)
+                    grads = tree_unflatten(grads, inp_spec)
+                    return grads
     
         return fw_outs, Continuation(continuation=bw_call, values=saved_values)
     return wrapped_f
