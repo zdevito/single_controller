@@ -63,6 +63,8 @@ def simulate_commands(worker_commands):
                 if len(worker_events[cur_worker]) > 0:
                     stream_events.append(worker_events[cur_worker][-1])
             start_time = max([i.end for i in input_events + stream_events], default=0)
+            # if start_time >= 5e9 and "comms" in str(worker) and "collective" in str(work_items[0].meta):
+            #     import ipdb; ipdb.set_trace()
             all_workers = all_workers_involved(work_items[0])
             for cur_worker in all_workers:
                 cur_task = worker_queues[cur_worker].pop(0) 
@@ -247,7 +249,7 @@ def get_runtime(msg):
             return 0
         return 0
     if isinstance(msg, Reduce):
-        return get_fake_tensor(msg.local_tensor_ref).numel() * 1e3 // 2
+        return get_fake_tensor(msg.local_tensor_ref).numel() * COLLECTIVE_SPEED
     raise NotImplementedError()
 
 class Task:
@@ -265,11 +267,15 @@ class Task:
         return f"T({self.runtime})"
 
 from torch.utils._pytree import tree_leaves
+BORROW_ID = -1
+COLLECTIVE_SPEED = 1e3
 class SimulatorBackend(MockBackend):
-    def __init__(self, world_size: int):
+    def __init__(self, world_size: int, collective_speed=1e3):
         super().__init__(world_size, verbose = False)
         self.worker_commands = defaultdict(list)
-        self.borrows = []
+        self.borrows = {}
+        global COLLECTIVE_SPEED
+        COLLECTIVE_SPEED = collective_speed
 
     def send(self, ranks: Union[NDSlice, List[NDSlice]], msg) -> None:
         super().send(ranks, msg)
@@ -309,11 +315,11 @@ class SimulatorBackend(MockBackend):
                 inputs = get_ids(msg.tensor)
                 outputs = get_ids(msg.result)
                 meta="borrow"
+                # import ipdb; ipdb.set_trace()
                 for rank in ranks:
                     for worker in rank:
-                        self.worker_commands[(worker, msg.to_stream.name)].append(Task(inputs=inputs, outputs=outputs, runtime=0, meta=meta, worker=(worker, msg.to_stream.name)))
-                # import ipdb; ipdb.set_trace()
-                # self.borrows.append((msg.from_stream, msg.to_stream, ))
+                        self.worker_commands[(worker, msg.from_stream.name)].append(Task(inputs=inputs, outputs=outputs, runtime=0, meta=meta, worker=(worker, msg.from_stream.name)))
+                return
             elif isinstance(msg, Reduce):
                 inputs = get_ids(msg.local_tensor_ref)
                 outputs = get_ids(msg.result)
@@ -322,9 +328,22 @@ class SimulatorBackend(MockBackend):
                 for rank in ranks:
                     for worker in rank:
                         self.worker_commands[(worker, msg.stream_ref.name)].append(Task(inputs=inputs, outputs=outputs, runtime=get_runtime(msg), meta=meta, worker=(worker, msg.stream_ref.name), collectives=collectives))
+                return
             elif isinstance(msg, BorrowFirstUse):
+                meta = "borrow_first_use"
+                # import ipdb; ipdb.set_trace()
+                for rank in ranks:
+                    for worker in rank:
+                        self.worker_commands[(worker, msg.to_stream.name)].append(Task(inputs=[msg.borrow], outputs=[], runtime=0, meta=meta, worker=(worker, msg.to_stream.name)))
                 return
             elif isinstance(msg, BorrowDrop):
+                meta="borrow_drop"
+                global BORROW_ID
+                for rank in ranks:
+                    for worker in rank:
+                        self.worker_commands[(worker, msg.to_stream.name)].append(Task(inputs=[], outputs=[BORROW_ID], runtime=0, meta=meta, worker=(worker, msg.to_stream.name)))
+                        self.worker_commands[(worker, msg.from_stream.name)].append(Task(inputs=[BORROW_ID], outputs=[], runtime=0, meta=meta, worker=(worker, msg.from_stream.name)))
+                BORROW_ID -= 1 
                 return
             else:
                 print(msg)

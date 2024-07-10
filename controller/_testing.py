@@ -124,8 +124,8 @@ def mock_mesh(hosts: int, gpus: int, verbose=True):
     dm.exit = lambda: None
     return dm
 
-def simulator_mesh(hosts: int, gpus: int):
-    backend = SimulatorBackend(hosts*gpus)
+def simulator_mesh(hosts: int, gpus: int, collective_speed: int):
+    backend = SimulatorBackend(hosts*gpus, collective_speed=collective_speed)
     ctrl = Controller(backend)
     dm = DeviceMesh(ctrl, NDSlice(0, [hosts, gpus], [gpus, 1]), ('host', 'gpu'))
     dm.exit = lambda: None

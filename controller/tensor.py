@@ -77,7 +77,7 @@ class Tensor(Referenceable, BaseTensor):
             alias._drop_ref()
         if borrows.origin_stream is not self.stream:
             borrow = borrows.active.pop(self.stream)
-            self.mesh._send(messages.BorrowDrop(borrow.id))
+            self.mesh._send(messages.BorrowDrop(borrow.id, borrows.origin_stream, self.stream))
             if not borrows.active:
                 borrows.writing_stream = borrows.origin_stream
 

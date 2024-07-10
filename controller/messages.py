@@ -73,9 +73,13 @@ class BorrowCreate(NamedTuple):
 
 class BorrowDrop(NamedTuple):
     borrow: int
+    from_stream: 'Stream'
+    to_stream: 'Stream'
 
 class BorrowFirstUse(NamedTuple):
     borrow: int
+    from_stream: 'Stream'
+    to_stream: 'Stream'
 
 class SendTensor(NamedTuple):
     result: 'Tensor'

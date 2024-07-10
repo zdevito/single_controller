@@ -145,7 +145,7 @@ class DeviceMesh(Referenceable):
         if tensor.stream is not borrows.origin_stream:
             borrow = borrows.active[tensor.stream]
             if not borrow.used:
-                self._send(messages.BorrowFirstUse(borrow.id))
+                self._send(messages.BorrowFirstUse(borrow.id, borrows.origin_stream, tensor.stream))
                 borrows.active[tensor.stream] = borrow._replace(used=True)
 
     def activate(self):
