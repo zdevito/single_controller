@@ -63,7 +63,7 @@ def simulate_commands(worker_commands):
                 if len(worker_events[cur_worker]) > 0:
                     stream_events.append(worker_events[cur_worker][-1])
             start_time = max([i.end for i in input_events + stream_events], default=0)
-            # if start_time >= 5e9 and "comms" in str(worker) and "collective" in str(work_items[0].meta):
+            # if start_time >= 5e9 and "main" in str(worker) and "borrow" in str(work_items[0].meta):
             #     import ipdb; ipdb.set_trace()
             all_workers = all_workers_involved(work_items[0])
             for cur_worker in all_workers:
@@ -289,7 +289,7 @@ class SimulatorBackend(MockBackend):
                 if isinstance(arg, torch.Tensor):
                     ids.append(arg.ref)
             return ids
-
+        BORROW_TIME = 1e3
         def process_msg(msg):
             if isinstance(msg, CallFunction):
                 inputs = get_ids(msg.args)
@@ -318,7 +318,7 @@ class SimulatorBackend(MockBackend):
                 # import ipdb; ipdb.set_trace()
                 for rank in ranks:
                     for worker in rank:
-                        self.worker_commands[(worker, msg.from_stream.name)].append(Task(inputs=inputs, outputs=outputs, runtime=0, meta=meta, worker=(worker, msg.from_stream.name)))
+                        self.worker_commands[(worker, msg.from_stream.name)].append(Task(inputs=inputs, outputs=outputs, runtime=BORROW_TIME, meta=meta, worker=(worker, msg.from_stream.name)))
                 return
             elif isinstance(msg, Reduce):
                 inputs = get_ids(msg.local_tensor_ref)
@@ -334,15 +334,15 @@ class SimulatorBackend(MockBackend):
                 # import ipdb; ipdb.set_trace()
                 for rank in ranks:
                     for worker in rank:
-                        self.worker_commands[(worker, msg.to_stream.name)].append(Task(inputs=[msg.borrow], outputs=[], runtime=0, meta=meta, worker=(worker, msg.to_stream.name)))
+                        self.worker_commands[(worker, msg.to_stream.name)].append(Task(inputs=[msg.borrow], outputs=[], runtime=BORROW_TIME, meta=meta, worker=(worker, msg.to_stream.name)))
                 return
             elif isinstance(msg, BorrowDrop):
                 meta="borrow_drop"
                 global BORROW_ID
                 for rank in ranks:
                     for worker in rank:
-                        self.worker_commands[(worker, msg.to_stream.name)].append(Task(inputs=[], outputs=[BORROW_ID], runtime=0, meta=meta, worker=(worker, msg.to_stream.name)))
-                        self.worker_commands[(worker, msg.from_stream.name)].append(Task(inputs=[BORROW_ID], outputs=[], runtime=0, meta=meta, worker=(worker, msg.from_stream.name)))
+                        self.worker_commands[(worker, msg.to_stream.name)].append(Task(inputs=[], outputs=[BORROW_ID], runtime=BORROW_TIME, meta=meta, worker=(worker, msg.to_stream.name)))
+                        self.worker_commands[(worker, msg.from_stream.name)].append(Task(inputs=[BORROW_ID], outputs=[], runtime=BORROW_TIME, meta=meta, worker=(worker, msg.from_stream.name)))
                 BORROW_ID -= 1 
                 return
             else:
