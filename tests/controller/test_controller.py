@@ -339,6 +339,33 @@ class TestController(TestCase):
         check(NDSlice(24, [4, 3, 8], [48*2, 16, 2]))
         check(NDSlice(37, [], []))
 
+        def check_contains_any(s, gen):
+            elems = set(s)
+            max_elem = max(elems)
+            span = max_elem - s.offset + 1
+            for _ in range(len(elems) * 32):
+                start = gen.randrange(s.offset - 10, max_elem + 10)
+                end = start + gen.choices(range(span), range(span, 0, -1))[0]
+                contains = s.contains_any(start, end)
+                ref = any(x in elems for x in range(start, end))
+                if contains != ref:
+                    raise RuntimeError(
+                        f"{s}.contains_any({start}, {end}) broken, false {'positive' if contains else 'negative'}"
+                    )
+
+        def check_union(s1, gen):
+            for _ in range(10):
+                s2 = fuzz(gen)
+                ref_elems = set(s1) | set(s2)
+                u = s1.union(s2)
+                elems = set()
+                for s in u:
+                    elems |= set(s)
+                if elems != ref_elems:
+                    raise RuntimeError(
+                        f"{s1}.union({s2}) broken, {'extra' if len(elems) > len(ref_elems) else 'missing'} elements"
+                    )
+
         def fuzz(gen):
             ndim = gen.choices([1, 2, 3, 4], [1, 2, 3, 4])[0]
             sizes = [gen.randrange(1, 10) for _ in range(ndim)]
@@ -360,6 +387,8 @@ class TestController(TestCase):
         for _ in range(1000):
             s = fuzz(gen)
             check(s)
+            check_contains_any(s, gen)
+            check_union(s, gen)
 
 
     def test_autograd(self):

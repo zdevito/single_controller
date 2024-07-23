@@ -52,12 +52,32 @@ class NDSlice:
             yield self.offset + sum(i*s for i, s in zip(loc, self.strides))
 
     def union(self, other: 'NDSlice') -> List['NDSlice']:
-        raise NotImplementedError()
+        # return a merged slice for pairs that meet regularity conditions
+        # and can be detected cheaply, otherwise just return the pair.
+        def sort(s):
+            strides, sizes = zip(*sorted(zip(s.strides, s.sizes), reverse=True))
+            return NDSlice(s.offset, list(sizes), list(strides))
+        s1, s2 = sort(self), sort(other)
+        s1, s2 = sorted([s1, s2], key=lambda s: s.offset)
+        extent = s1.sizes[0] * s1.strides[0]
+        if s1.offset + extent == s2.offset:
+            if s1.strides == s2.strides and s1.sizes[1:] == s2.sizes[1:]:
+                # congruent inner shape and strides, concatenated on long axis
+                sizes = [s1.sizes[0] + s2.sizes[0]] + s1.sizes[1:]
+                return [NDSlice(s1.offset, sizes, s1.strides)]
+        # fallback
+        return [self, other]
     
     def contains_any(self, start: int, end: int) -> bool:
         # does this slice contain any of the elements in [start, end)
         # will be used to figure out who to broadcast to.
-        raise NotImplementedError()
+        base = self.offset
+        for stride, size in sorted(zip(self.strides, self.sizes), reverse=True):
+            if end <= base or start >= base + size * stride:
+                return False
+            shift = max(0, min(size - 1, (end - base - 1) // stride))
+            base += shift * stride
+        return base >= start and base < end
     
     def index(self, value: int) -> int:
         # return _flat_ index  where self[index] == value,
